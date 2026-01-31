@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/api/option"
 	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/apiserver-network-proxy/cmd/bucket-agent/app/options"
@@ -65,7 +66,10 @@ func (a *BucketProxyAgent) Run(o *options.BucketProxyAgentOptions, stopCh <-chan
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := bucket.NewFSStore(o.BucketDir)
+	store, err := createStore(ctx, o)
+	if err != nil {
+		return fmt.Errorf("failed to create store: %v", err)
+	}
 
 	// Create and start the bucket agent.
 	a.agent = bucket.NewBucketAgent(ctx, store, o.NodeID, o.PollInterval)
@@ -153,6 +157,21 @@ func (a *BucketProxyAgent) runAdminServer(o *options.BucketProxyAgentOptions) er
 	}()
 
 	return nil
+}
+
+func createStore(ctx context.Context, o *options.BucketProxyAgentOptions) (bucket.Store, error) {
+	switch o.StoreType {
+	case "fs":
+		return bucket.NewFSStore(o.BucketDir), nil
+	case "gcs":
+		var opts []option.ClientOption
+		if o.GCSCredentialsFile != "" {
+			opts = append(opts, option.WithCredentialsFile(o.GCSCredentialsFile))
+		}
+		return bucket.NewGCSStore(ctx, o.GCSBucket, o.GCSPrefix, opts...)
+	default:
+		return nil, fmt.Errorf("unknown store type %q", o.StoreType)
+	}
 }
 
 var shutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}

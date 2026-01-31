@@ -33,6 +33,8 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"k8s.io/klog/v2"
 
+	"google.golang.org/api/option"
+
 	"sigs.k8s.io/apiserver-network-proxy/cmd/bucket-server/app/options"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/bucket"
@@ -79,7 +81,11 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p.store = bucket.NewFSStore(o.BucketDir)
+	store, err := createStore(ctx, o)
+	if err != nil {
+		return fmt.Errorf("failed to create store: %v", err)
+	}
+	p.store = store
 	p.transports = make(map[string]*bucket.BucketTransport)
 
 	// Create ProxyServer.
@@ -289,6 +295,21 @@ func (p *BucketProxyServer) runAdminServer(o *options.BucketProxyServerOptions) 
 	}()
 
 	return nil
+}
+
+func createStore(ctx context.Context, o *options.BucketProxyServerOptions) (bucket.Store, error) {
+	switch o.StoreType {
+	case "fs":
+		return bucket.NewFSStore(o.BucketDir), nil
+	case "gcs":
+		var opts []option.ClientOption
+		if o.GCSCredentialsFile != "" {
+			opts = append(opts, option.WithCredentialsFile(o.GCSCredentialsFile))
+		}
+		return bucket.NewGCSStore(ctx, o.GCSBucket, o.GCSPrefix, opts...)
+	default:
+		return nil, fmt.Errorf("unknown store type %q", o.StoreType)
+	}
 }
 
 var shutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}

@@ -28,7 +28,11 @@ import (
 
 type BucketProxyServerOptions struct {
 	// Bucket store configuration.
-	BucketDir string // Path to the filesystem bucket directory.
+	StoreType          string // "fs" or "gcs"
+	BucketDir          string // Path to the filesystem bucket directory (store-type=fs).
+	GCSBucket          string // GCS bucket name (store-type=gcs).
+	GCSPrefix          string // Optional prefix within GCS bucket.
+	GCSCredentialsFile string // Optional path to service account key (default: ADC).
 
 	// Frontend (kube-apiserver facing) configuration.
 	// The frontend uses a UDS so kube-apiserver's EgressSelector can connect locally.
@@ -54,6 +58,7 @@ type BucketProxyServerOptions struct {
 
 func NewBucketProxyServerOptions() *BucketProxyServerOptions {
 	return &BucketProxyServerOptions{
+		StoreType:             "fs",
 		BucketDir:             "",
 		UdsName:               "",
 		DeleteUDSFile:         true,
@@ -70,7 +75,11 @@ func NewBucketProxyServerOptions() *BucketProxyServerOptions {
 
 func (o *BucketProxyServerOptions) Flags() *pflag.FlagSet {
 	flags := pflag.NewFlagSet("bucket-proxy-server", pflag.ContinueOnError)
-	flags.StringVar(&o.BucketDir, "bucket-dir", o.BucketDir, "Path to the filesystem bucket directory for message storage.")
+	flags.StringVar(&o.StoreType, "store-type", o.StoreType, "Backend store type: 'fs' or 'gcs'.")
+	flags.StringVar(&o.BucketDir, "bucket-dir", o.BucketDir, "Path to the filesystem bucket directory for message storage (store-type=fs).")
+	flags.StringVar(&o.GCSBucket, "gcs-bucket", o.GCSBucket, "GCS bucket name for message storage (store-type=gcs).")
+	flags.StringVar(&o.GCSPrefix, "gcs-prefix", o.GCSPrefix, "Optional key prefix within the GCS bucket.")
+	flags.StringVar(&o.GCSCredentialsFile, "gcs-credentials-file", o.GCSCredentialsFile, "Path to GCS service account key file. Empty uses application default credentials.")
 	flags.StringVar(&o.UdsName, "uds-name", o.UdsName, "Unix domain socket path for frontend (kube-apiserver) connections.")
 	flags.BoolVar(&o.DeleteUDSFile, "delete-existing-uds-file", o.DeleteUDSFile, "If true and UDS file already exists, delete before listening.")
 	flags.StringVar(&o.Mode, "mode", o.Mode, "Frontend mode: 'grpc' or 'http-connect'.")
@@ -85,7 +94,10 @@ func (o *BucketProxyServerOptions) Flags() *pflag.FlagSet {
 }
 
 func (o *BucketProxyServerOptions) Print() {
+	klog.V(1).Infof("StoreType set to %q.\n", o.StoreType)
 	klog.V(1).Infof("BucketDir set to %q.\n", o.BucketDir)
+	klog.V(1).Infof("GCSBucket set to %q.\n", o.GCSBucket)
+	klog.V(1).Infof("GCSPrefix set to %q.\n", o.GCSPrefix)
 	klog.V(1).Infof("UdsName set to %q.\n", o.UdsName)
 	klog.V(1).Infof("DeleteUDSFile set to %v.\n", o.DeleteUDSFile)
 	klog.V(1).Infof("Mode set to %q.\n", o.Mode)
@@ -99,13 +111,22 @@ func (o *BucketProxyServerOptions) Print() {
 }
 
 func (o *BucketProxyServerOptions) Validate() error {
-	if o.BucketDir == "" {
-		return fmt.Errorf("--bucket-dir is required")
-	}
-	if info, err := os.Stat(o.BucketDir); err != nil {
-		return fmt.Errorf("--bucket-dir %q: %v", o.BucketDir, err)
-	} else if !info.IsDir() {
-		return fmt.Errorf("--bucket-dir %q is not a directory", o.BucketDir)
+	switch o.StoreType {
+	case "fs":
+		if o.BucketDir == "" {
+			return fmt.Errorf("--bucket-dir is required when --store-type=fs")
+		}
+		if info, err := os.Stat(o.BucketDir); err != nil {
+			return fmt.Errorf("--bucket-dir %q: %v", o.BucketDir, err)
+		} else if !info.IsDir() {
+			return fmt.Errorf("--bucket-dir %q is not a directory", o.BucketDir)
+		}
+	case "gcs":
+		if o.GCSBucket == "" {
+			return fmt.Errorf("--gcs-bucket is required when --store-type=gcs")
+		}
+	default:
+		return fmt.Errorf("--store-type must be 'fs' or 'gcs', got %q", o.StoreType)
 	}
 	if o.UdsName == "" {
 		return fmt.Errorf("--uds-name is required (frontend UDS path)")
