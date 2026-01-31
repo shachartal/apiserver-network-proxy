@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-apiserver
+  namespace: overlay-system
+  labels:
+    component: kube-apiserver
+spec:
+  containers:
+    # --- kube-apiserver ---
+    - name: kube-apiserver
+      image: registry.k8s.io/kube-apiserver:v1.30.0
+      command:
+        - kube-apiserver
+        - --etcd-servers=http://etcd.overlay-system.svc:2379
+        - --tls-cert-file=/pki/apiserver.crt
+        - --tls-private-key-file=/pki/apiserver.key
+        - --client-ca-file=/pki/ca.crt
+        - --service-account-key-file=/pki/sa.pub
+        - --service-account-signing-key-file=/pki/sa.key
+        - --service-account-issuer=https://kubernetes.default.svc
+        - --authorization-mode=Node,RBAC
+        - --allow-privileged=true
+        - --service-cluster-ip-range=10.96.0.0/12
+        - --egress-selector-config-file=/etc/kubernetes/egress-selector/egress-selector-configuration.yaml
+        - --v=2
+      ports:
+        - containerPort: 6443
+          name: https
+      volumeMounts:
+        - name: pki
+          mountPath: /pki
+          readOnly: true
+        - name: egress-selector
+          mountPath: /etc/kubernetes/egress-selector
+          readOnly: true
+        - name: konnectivity-uds
+          mountPath: /run/konnectivity
+      readinessProbe:
+        httpGet:
+          path: /readyz
+          port: 6443
+          scheme: HTTPS
+        initialDelaySeconds: 10
+        periodSeconds: 5
+
+    # --- bucket-proxy-server (sidecar) ---
+    - name: bucket-proxy-server
+      image: bucket-proxy-server:dev
+      command:
+        - /bucket-proxy-server
+        - --bucket-dir=/bucket
+        - --uds-name=/run/konnectivity/konnectivity.socket
+        - --server-id=bucket-server-0
+        - --health-port=8092
+        - --admin-port=8095
+        - --v=4
+      ports:
+        - containerPort: 8092
+          name: health
+      volumeMounts:
+        - name: konnectivity-uds
+          mountPath: /run/konnectivity
+        - name: bucket
+          mountPath: /bucket
+      readinessProbe:
+        httpGet:
+          path: /healthz
+          port: 8092
+        initialDelaySeconds: 5
+        periodSeconds: 5
+
+  volumes:
+    - name: pki
+      secret:
+        secretName: overlay-pki
+    - name: egress-selector
+      configMap:
+        name: egress-selector-config
+    - name: konnectivity-uds
+      emptyDir: {}
+    - name: bucket
+      hostPath:
+        path: /bucket
+        type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-apiserver
+  namespace: overlay-system
+spec:
+  type: NodePort
+  selector:
+    component: kube-apiserver
+  ports:
+    - port: 6443
+      targetPort: 6443
+      nodePort: 30443

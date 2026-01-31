@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-controller-manager
+  namespace: overlay-system
+  labels:
+    component: kube-controller-manager
+spec:
+  containers:
+    - name: kube-controller-manager
+      image: registry.k8s.io/kube-controller-manager:v1.30.0
+      command:
+        - kube-controller-manager
+        - --kubeconfig=/etc/kubernetes/controller-manager.kubeconfig
+        - --authentication-kubeconfig=/etc/kubernetes/controller-manager.kubeconfig
+        - --authorization-kubeconfig=/etc/kubernetes/controller-manager.kubeconfig
+        - --cluster-signing-cert-file=/pki/ca.crt
+        - --cluster-signing-key-file=/pki/ca.key
+        - --root-ca-file=/pki/ca.crt
+        - --service-account-private-key-file=/pki/sa.key
+        - --use-service-account-credentials=true
+        - --controllers=*
+        - --v=2
+      volumeMounts:
+        - name: pki
+          mountPath: /pki
+          readOnly: true
+        - name: kubeconfig
+          mountPath: /etc/kubernetes
+          readOnly: true
+  volumes:
+    - name: pki
+      secret:
+        secretName: overlay-pki
+    - name: kubeconfig
+      secret:
+        secretName: overlay-kubeconfigs
+        items:
+          - key: controller-manager.kubeconfig
+            path: controller-manager.kubeconfig

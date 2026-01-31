@@ -140,11 +140,19 @@ bin/bucket-proxy-server-linux-amd64:
 bin/bucket-proxy-agent-linux-amd64:
 	GO111MODULE=on GOOS=linux GOARCH=amd64 go build -mod=vendor -o bin/bucket-proxy-agent-linux-amd64 cmd/bucket-agent/main.go
 
+.PHONY: bin/bucket-proxy-server-linux-arm64
+bin/bucket-proxy-server-linux-arm64:
+	GO111MODULE=on GOOS=linux GOARCH=arm64 go build -mod=vendor -o bin/bucket-proxy-server-linux-arm64 cmd/bucket-server/main.go
+
+.PHONY: bin/bucket-proxy-agent-linux-arm64
+bin/bucket-proxy-agent-linux-arm64:
+	GO111MODULE=on GOOS=linux GOARCH=arm64 go build -mod=vendor -o bin/bucket-proxy-agent-linux-arm64 cmd/bucket-agent/main.go
+
 .PHONY: build-bucket
 build-bucket: bin/bucket-proxy-server bin/bucket-proxy-agent
 
 .PHONY: build-bucket-linux
-build-bucket-linux: bin/bucket-proxy-server-linux-amd64 bin/bucket-proxy-agent-linux-amd64
+build-bucket-linux: bin/bucket-proxy-server-linux-amd64 bin/bucket-proxy-agent-linux-amd64 bin/bucket-proxy-server-linux-arm64 bin/bucket-proxy-agent-linux-arm64
 
 ## --------------------------------------
 ## Linting

@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: etcd
+  namespace: overlay-system
+  labels:
+    component: etcd
+spec:
+  containers:
+    - name: etcd
+      image: registry.k8s.io/etcd:3.5.12-0
+      command:
+        - etcd
+        - --data-dir=/var/lib/etcd
+        - --name=etcd-0
+        - --listen-client-urls=http://0.0.0.0:2379
+        - --advertise-client-urls=http://etcd.overlay-system.svc:2379
+        - --listen-peer-urls=http://0.0.0.0:2380
+        - --initial-advertise-peer-urls=http://etcd.overlay-system.svc:2380
+        - --initial-cluster=etcd-0=http://etcd.overlay-system.svc:2380
+        - --initial-cluster-state=new
+      ports:
+        - containerPort: 2379
+          name: client
+        - containerPort: 2380
+          name: peer
+      volumeMounts:
+        - name: etcd-data
+          mountPath: /var/lib/etcd
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 2379
+        initialDelaySeconds: 5
+        periodSeconds: 5
+  volumes:
+    - name: etcd-data
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+  namespace: overlay-system
+spec:
+  selector:
+    component: etcd
+  ports:
+    - port: 2379
+      targetPort: 2379
+      name: client
+    - port: 2380
+      targetPort: 2380
+      name: peer

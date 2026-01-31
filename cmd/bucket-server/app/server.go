@@ -172,6 +172,36 @@ func (p *BucketProxyServer) unregisterNode(nodeID string) {
 	transport.Close()
 	p.poller.UnregisterNode(nodeID)
 	delete(p.transports, nodeID)
+
+	// Clean up stale heartbeat and data files for this node in the background.
+	go p.cleanupNodeFiles(nodeID)
+}
+
+// cleanupNodeFiles removes residual bucket objects for a stale node.
+// This includes heartbeat files and any unconsumed data messages.
+func (p *BucketProxyServer) cleanupNodeFiles(nodeID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	prefixes := []string{
+		"node-to-control/" + nodeID + "/",
+		"control-to-node/" + nodeID + "/",
+	}
+	for _, prefix := range prefixes {
+		keys, err := p.store.List(ctx, prefix)
+		if err != nil {
+			klog.V(4).InfoS("Failed to list keys for stale node cleanup", "prefix", prefix, "err", err)
+			continue
+		}
+		for _, key := range keys {
+			if err := p.store.Delete(ctx, key); err != nil {
+				klog.V(4).InfoS("Failed to delete stale key", "key", key, "err", err)
+			}
+		}
+		if len(keys) > 0 {
+			klog.V(2).InfoS("Cleaned up stale node files", "nodeID", nodeID, "prefix", prefix, "count", len(keys))
+		}
+	}
 }
 
 func (p *BucketProxyServer) runFrontendServer(ctx context.Context, o *options.BucketProxyServerOptions) error {
