@@ -18,6 +18,7 @@ package bucket
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -130,7 +131,7 @@ func (s *GCSStore) List(ctx context.Context, prefix string) ([]string, error) {
 func (s *GCSStore) Delete(ctx context.Context, key string) error {
 	obj := s.client.Bucket(s.bucket).Object(s.objectName(key))
 	err := obj.Delete(ctx)
-	if err == storage.ErrObjectNotExist {
+	if errors.Is(err, storage.ErrObjectNotExist) {
 		return nil
 	}
 	if err != nil {

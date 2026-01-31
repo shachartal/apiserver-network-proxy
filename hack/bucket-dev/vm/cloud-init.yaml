@@ -1,11 +1,18 @@
 #cloud-config
 # Cloud-init for the bucket-agent Multipass VM.
 #
-# This only writes config files and creates directories.
-# Binary installation is done by setup.sh AFTER the native mount is ready,
-# by calling install-from-bucket.sh via multipass exec.
+# Placeholders (substituted by setup.sh at render time):
+#   GCS credentials, kubelet kubeconfig, GCS bucket/prefix, node ID
+#
+# The VM is air-gapped (no internet access, only GCS bucket access).
+# install-from-bucket.sh uses curl + GCS REST API to download distributables.
 
 package_update: false
+manage_etc_hosts: false
+
+runcmd:
+  - mkdir -p /etc/kubernetes/pki
+  - echo "127.0.0.1 NODE_ID_PLACEHOLDER" >> /etc/hosts
 
 write_files:
   # containerd config
@@ -19,6 +26,18 @@ write_files:
             runtime_type = "io.containerd.runc.v2"
             [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
               SystemdCgroup = true
+
+  # GCS credentials for bucket-proxy-agent (injected by setup.sh)
+  - path: /etc/gcs/application_default_credentials.json
+    permissions: '0600'
+    content: |
+      GCS_CREDENTIALS_PLACEHOLDER
+
+  # kubelet kubeconfig (injected by setup.sh — contains private key, never stored in bucket)
+  - path: /etc/kubernetes/kubelet.kubeconfig
+    permissions: '0600'
+    content: |
+      KUBELET_KUBECONFIG_PLACEHOLDER
 
   # kubelet config
   - path: /var/lib/kubelet/config.yaml
@@ -66,7 +85,10 @@ write_files:
 
       [Service]
       ExecStart=/usr/local/bin/bucket-proxy-agent \
-        --bucket-dir=/mnt/bucket \
+        --store-type=gcs \
+        --gcs-bucket=GCS_BUCKET_PLACEHOLDER \
+        --gcs-prefix=GCS_PREFIX_PLACEHOLDER \
+        --gcs-credentials-file=/etc/gcs/application_default_credentials.json \
         --node-id=NODE_ID_PLACEHOLDER \
         --poll-interval=0 \
         --v=4
@@ -76,32 +98,131 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 
-  # Install script that pulls everything from the bucket
+  # Install script that pulls everything from GCS using curl + REST API.
+  # No gsutil or gcloud needed — works on air-gapped VMs with only curl.
   - path: /usr/local/bin/install-from-bucket.sh
     permissions: '0755'
     content: |
       #!/bin/bash
       set -euo pipefail
-      BASE=/mnt/bucket/distributables
 
-      # Detect architecture and select the right subdirectory.
+      GCS_BUCKET="GCS_BUCKET_PLACEHOLDER"
+      GCS_PREFIX="GCS_PREFIX_PLACEHOLDER"
+      CREDS_FILE="/etc/gcs/application_default_credentials.json"
+      LOCAL_BASE="/tmp/bucket-distributables"
+
+      # ---- GCS REST API helpers using curl ----
+
+      # Extract a JSON string value using python3 (available in Ubuntu base).
+      json_get() {
+        python3 -c "import json,sys; print(json.load(sys.stdin)['$1'])"
+      }
+
+      # Obtain an OAuth2 access token from the refresh token in the credentials file.
+      get_access_token() {
+        local client_id client_secret refresh_token
+        client_id=$(json_get client_id < "$CREDS_FILE")
+        client_secret=$(json_get client_secret < "$CREDS_FILE")
+        refresh_token=$(json_get refresh_token < "$CREDS_FILE")
+
+        curl -sf -X POST "https://oauth2.googleapis.com/token" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          -d "client_id=${client_id}&client_secret=${client_secret}&refresh_token=${refresh_token}&grant_type=refresh_token" \
+          | json_get access_token
+      }
+
+      # Download a single object from GCS.
+      # Usage: gcs_download <gcs_object_name> <local_path>
+      gcs_download() {
+        local object="$1" dest="$2"
+        # URL-encode the object name (replace / with %2F).
+        local encoded
+        encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$object', safe=''))")
+        mkdir -p "$(dirname "$dest")"
+        curl -sf -o "$dest" \
+          -H "Authorization: Bearer $ACCESS_TOKEN" \
+          "https://storage.googleapis.com/storage/v1/b/${GCS_BUCKET}/o/${encoded}?alt=media"
+      }
+
+      # List objects in GCS under a prefix.
+      # Returns one object name per line.
+      gcs_list() {
+        local prefix="$1"
+        local encoded_prefix
+        encoded_prefix=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$prefix', safe=''))")
+        local url="https://storage.googleapis.com/storage/v1/b/${GCS_BUCKET}/o?prefix=${encoded_prefix}&maxResults=1000"
+        local next_page_token=""
+
+        while true; do
+          local page_url="$url"
+          if [ -n "$next_page_token" ]; then
+            page_url="${url}&pageToken=${next_page_token}"
+          fi
+
+          local response
+          response=$(curl -sf -H "Authorization: Bearer $ACCESS_TOKEN" "$page_url")
+
+          echo "$response" | python3 -c "
+      import json, sys
+      data = json.load(sys.stdin)
+      for item in data.get('items', []):
+          print(item['name'])
+      " 2>/dev/null || true
+
+          next_page_token=$(echo "$response" | python3 -c "
+      import json, sys
+      data = json.load(sys.stdin)
+      print(data.get('nextPageToken', ''))
+      " 2>/dev/null || true)
+
+          if [ -z "$next_page_token" ]; then
+            break
+          fi
+        done
+      }
+
+      # ---- Main install logic ----
+
+      echo "==> Obtaining GCS access token..."
+      ACCESS_TOKEN=$(get_access_token)
+      if [ -z "$ACCESS_TOKEN" ]; then
+        echo "ERROR: Failed to obtain access token"
+        exit 1
+      fi
+      echo "==> Access token obtained."
+
+      # Detect architecture.
       ARCH=$(uname -m)
       case "$ARCH" in
-        x86_64)  ARCH_DIR="$BASE/amd64" ;;
-        aarch64) ARCH_DIR="$BASE/arm64" ;;
+        x86_64)  ARCH_SUFFIX="amd64" ;;
+        aarch64) ARCH_SUFFIX="arm64" ;;
         *) echo "ERROR: unsupported arch $ARCH"; exit 1 ;;
       esac
 
-      echo "==> Installing from bucket distributables ($ARCH_DIR)..."
+      ARCH_DIR="$LOCAL_BASE/$ARCH_SUFFIX"
+      mkdir -p "$ARCH_DIR/debs"
 
-      if [ ! -d "$ARCH_DIR" ]; then
-        echo "ERROR: $ARCH_DIR not found. Is the bucket mounted?"
-        exit 1
-      fi
+      echo "==> Downloading distributables from gs://${GCS_BUCKET}/${GCS_PREFIX}distributables/${ARCH_SUFFIX}/..."
+
+      # List and download all arch-specific distributables.
+      DIST_PREFIX="${GCS_PREFIX}distributables/${ARCH_SUFFIX}/"
+      gcs_list "$DIST_PREFIX" | while IFS= read -r obj; do
+        # Strip the GCS prefix to get the relative path.
+        rel="${obj#${DIST_PREFIX}}"
+        [ -z "$rel" ] && continue
+        echo "    downloading: $rel"
+        gcs_download "$obj" "$ARCH_DIR/$rel"
+      done
+
+      # Download containerd.service (architecture-independent).
+      echo "    downloading: containerd.service"
+      gcs_download "${GCS_PREFIX}distributables/containerd.service" "$LOCAL_BASE/containerd.service"
+
+      echo "==> Installing from downloaded distributables ($ARCH_DIR)..."
 
       # Install required deb packages (offline, ignore errors for optional deps)
       if ls "$ARCH_DIR/debs"/*.deb >/dev/null 2>&1; then
-        echo "==> Installing deb packages from bucket..."
+        echo "==> Installing deb packages..."
         dpkg -i "$ARCH_DIR/debs"/*.deb 2>&1 || true
       fi
 
@@ -109,7 +230,7 @@ write_files:
       if [ ! -f /usr/local/bin/containerd ]; then
         echo "==> Installing containerd..."
         tar -C /usr/local -xzf "$ARCH_DIR/containerd.tar.gz"
-        cp "$BASE/containerd.service" /etc/systemd/system/containerd.service
+        cp "$LOCAL_BASE/containerd.service" /etc/systemd/system/containerd.service
         cp "$ARCH_DIR/runc" /usr/local/sbin/runc
         chmod +x /usr/local/sbin/runc
         mkdir -p /opt/cni/bin
@@ -119,7 +240,6 @@ write_files:
       fi
 
       # Install minimal CNI config (bridge + host-local IPAM).
-      # No CNI daemon needed — this makes kubelet report the node as Ready.
       mkdir -p /etc/cni/net.d
       echo '{"cniVersion":"1.0.0","name":"bridge","plugins":[{"type":"bridge","bridge":"cni0","isGateway":true,"ipMasq":true,"ipam":{"type":"host-local","subnet":"10.244.0.0/24"}},{"type":"loopback"}]}' > /etc/cni/net.d/10-bridge.conflist
 
@@ -151,31 +271,12 @@ write_files:
         ctr -n k8s.io images import "$ARCH_DIR/pause.tar" 2>&1 || true
       fi
 
-      # Copy PKI material from bucket
-      BUCKET=/mnt/bucket
-      if [ -d "$BUCKET/pki" ]; then
-        echo "==> Installing PKI from bucket..."
-        cp "$BUCKET/pki/ca.crt" /etc/kubernetes/pki/ca.crt
-        cp "$BUCKET/pki/kubelet.kubeconfig" /etc/kubernetes/kubelet.kubeconfig
-      else
-        echo "WARNING: $BUCKET/pki not found, skipping PKI install"
-      fi
-
-      # Read the node ID injected into the bucket by the control plane.
-      if [ -f "$BUCKET/pki/node-id" ]; then
-        NODE_ID=$(cat "$BUCKET/pki/node-id" | tr -d '[:space:]')
-        echo "==> Node ID from bucket: $NODE_ID"
-        # Substitute the placeholder in systemd unit files.
-        sed -i "s/NODE_ID_PLACEHOLDER/$NODE_ID/g" /etc/systemd/system/kubelet.service
-        sed -i "s/NODE_ID_PLACEHOLDER/$NODE_ID/g" /etc/systemd/system/bucket-proxy-agent.service
-        # Add the node ID to /etc/hosts so the bucket-proxy-agent can resolve
-        # DIAL_REQ addresses targeting this node (apiserver uses the hostname
-        # from --hostname-override when connecting to kubelet).
-        echo "127.0.0.1 $NODE_ID" >> /etc/hosts
-      else
-        echo "ERROR: $BUCKET/pki/node-id not found — cannot configure services"
-        exit 1
-      fi
+      # Download public PKI material from GCS.
+      # The kubelet kubeconfig (containing the private key) is injected via
+      # cloud-init and is already at /etc/kubernetes/kubelet.kubeconfig.
+      # The node ID is baked into the systemd units by setup.sh at render time.
+      echo "==> Downloading PKI from GCS..."
+      gcs_download "${GCS_PREFIX}pki/ca.crt" /etc/kubernetes/pki/ca.crt
 
       # Start services
       echo "==> Starting services..."
@@ -188,10 +289,7 @@ write_files:
         echo "WARNING: Skipping service start — missing kubeconfig or agent binary"
       fi
 
-      echo "==> Installation from bucket complete."
+      # Clean up downloaded distributables
+      rm -rf "$LOCAL_BASE"
 
-runcmd:
-  # Create directories only — binary installation happens later via setup.sh
-  # after the native mount is established.
-  - mkdir -p /mnt/bucket
-  - mkdir -p /etc/kubernetes/pki
+      echo "==> Installation from bucket complete."

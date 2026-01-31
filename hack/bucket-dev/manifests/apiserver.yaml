@@ -51,7 +51,10 @@ spec:
       image: bucket-proxy-server:dev
       command:
         - /bucket-proxy-server
-        - --bucket-dir=/bucket
+        - --store-type=gcs
+        - --gcs-bucket=shachar-test
+        - --gcs-prefix=bucket-dev/
+        - --gcs-credentials-file=/gcs/application_default_credentials.json
         - --uds-name=/run/konnectivity/konnectivity.socket
         - --server-id=bucket-server-0
         - --health-port=8092
@@ -63,8 +66,9 @@ spec:
       volumeMounts:
         - name: konnectivity-uds
           mountPath: /run/konnectivity
-        - name: bucket
-          mountPath: /bucket
+        - name: gcs-credentials
+          mountPath: /gcs
+          readOnly: true
       readinessProbe:
         httpGet:
           path: /healthz
@@ -81,10 +85,9 @@ spec:
         name: egress-selector-config
     - name: konnectivity-uds
       emptyDir: {}
-    - name: bucket
-      hostPath:
-        path: /bucket
-        type: DirectoryOrCreate
+    - name: gcs-credentials
+      secret:
+        secretName: gcs-credentials
 ---
 apiVersion: v1
 kind: Service
