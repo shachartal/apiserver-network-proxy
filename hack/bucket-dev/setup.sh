@@ -90,16 +90,20 @@ log "Generating PKI"
 # On macOS with Multipass, the host is typically reachable at 192.168.64.1.
 HOST_IP="${HOST_IP:-192.168.64.1}"
 
+# Generate control-plane PKI (CA + apiserver, admin, controller-manager, scheduler certs).
 APISERVER_EXTRA_SANS="IP:${HOST_IP}" \
-KUBELET_APISERVER_URL="https://${HOST_IP}:30443" \
-NODE_ID="$NODE_ID" \
     "$SCRIPT_DIR/generate-pki.sh" "$PKI_DIR"
+
+# Generate per-node PKI (kubelet cert + kubeconfig).
+NODE_ID="$NODE_ID" \
+KUBELET_APISERVER_URL="https://${HOST_IP}:30443" \
+    "$SCRIPT_DIR/generate-node-pki.sh" "$PKI_DIR"
 
 # Copy PKI files and node config into the bucket so install-from-bucket.sh
 # can find them without needing multipass transfer.
 mkdir -p "$BUCKET_DIR/pki"
 cp "$PKI_DIR/ca.crt" "$BUCKET_DIR/pki/ca.crt"
-cp "$PKI_DIR/kubelet.kubeconfig" "$BUCKET_DIR/pki/kubelet.kubeconfig"
+cp "$PKI_DIR/kubelet-${NODE_ID}.kubeconfig" "$BUCKET_DIR/pki/kubelet.kubeconfig"
 
 # Write the node ID into the bucket so the VM can pick it up.
 echo "$NODE_ID" > "$BUCKET_DIR/pki/node-id"
@@ -155,6 +159,8 @@ kubectl -n "$NAMESPACE" create secret generic overlay-pki \
     --from-file=ca.key="$PKI_DIR/ca.key" \
     --from-file=apiserver.crt="$PKI_DIR/apiserver.crt" \
     --from-file=apiserver.key="$PKI_DIR/apiserver.key" \
+    --from-file=apiserver-kubelet-client.crt="$PKI_DIR/apiserver-kubelet-client.crt" \
+    --from-file=apiserver-kubelet-client.key="$PKI_DIR/apiserver-kubelet-client.key" \
     --from-file=sa.key="$PKI_DIR/sa.key" \
     --from-file=sa.pub="$PKI_DIR/sa.pub" \
     --dry-run=client -o yaml | kubectl apply -f -
@@ -243,7 +249,8 @@ echo "Verifying VM is responsive..."
 multipass exec "$VM_NAME" -- hostname
 
 # Verify mount is accessible.
-multipass exec "$VM_NAME" -- sudo ls /mnt/bucket/distributables/ >/dev/null
+echo "Checking mount..."
+multipass exec "$VM_NAME" -- ls /mnt/bucket/distributables/
 echo "Native mount verified."
 
 # ============================================================

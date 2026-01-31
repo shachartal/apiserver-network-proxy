@@ -19,6 +19,8 @@ spec:
         - --service-account-key-file=/pki/sa.pub
         - --service-account-signing-key-file=/pki/sa.key
         - --service-account-issuer=https://kubernetes.default.svc
+        - --kubelet-client-certificate=/pki/apiserver-kubelet-client.crt
+        - --kubelet-client-key=/pki/apiserver-kubelet-client.key
         - --authorization-mode=Node,RBAC
         - --allow-privileged=true
         - --service-cluster-ip-range=10.96.0.0/12

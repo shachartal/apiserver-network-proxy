@@ -18,6 +18,7 @@ package bucket
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -265,31 +266,64 @@ func (r *RegionalPoller) downloadAndDispatch(refs []messageRef) {
 		close(results)
 	}()
 
-	// Dispatch results to node handlers.
+	// Collect all results, then sort by sequence number to guarantee in-order
+	// delivery. The worker pool downloads in parallel, so results arrive in
+	// arbitrary order — but TLS and other stream protocols require strict ordering.
+	var collected []result
 	for res := range results {
+		collected = append(collected, res)
+	}
+	sort.Slice(collected, func(i, j int) bool {
+		return collected[i].ref.seq < collected[j].ref.seq
+	})
+
+	// Group by nodeID so we can check contiguity per-node.
+	byNode := make(map[string][]result)
+	for _, res := range collected {
+		byNode[res.ref.nodeID] = append(byNode[res.ref.nodeID], res)
+	}
+
+	// Dispatch only the contiguous prefix for each node. If there is a gap
+	// (e.g., seq 1,3 with 2 missing), deliver only up to the gap. Messages
+	// beyond the gap are left in the bucket for the next poll cycle.
+	// This prevents out-of-order delivery that would corrupt TLS streams.
+	for nodeID, nodeResults := range byNode {
 		r.mu.RLock()
-		h, ok := r.handlers[res.ref.nodeID]
+		h, ok := r.handlers[nodeID]
 		r.mu.RUnlock()
 
 		if !ok {
-			_ = r.store.Delete(r.ctx, res.ref.key)
+			for _, res := range nodeResults {
+				_ = r.store.Delete(r.ctx, res.ref.key)
+			}
 			continue
 		}
 
-		// Update sequence tracking.
-		r.mu.Lock()
-		if res.ref.seq > h.recvSeq {
+		r.mu.RLock()
+		expectedSeq := h.recvSeq + 1
+		r.mu.RUnlock()
+
+		for _, res := range nodeResults {
+			if res.ref.seq != expectedSeq {
+				// Gap detected — stop delivering for this node.
+				// Remaining messages stay in the bucket for next poll.
+				klog.V(4).InfoS("RegionalPoller gap detected, deferring remaining messages",
+					"nodeID", nodeID, "expected", expectedSeq, "got", res.ref.seq)
+				break
+			}
+
+			r.mu.Lock()
 			h.recvSeq = res.ref.seq
-		}
-		r.mu.Unlock()
+			r.mu.Unlock()
 
-		// Delete after successful read.
-		_ = r.store.Delete(r.ctx, res.ref.key)
+			_ = r.store.Delete(r.ctx, res.ref.key)
 
-		select {
-		case h.recvCh <- res.pkt:
-		case <-r.ctx.Done():
-			return
+			select {
+			case h.recvCh <- res.pkt:
+			case <-r.ctx.Done():
+				return
+			}
+			expectedSeq++
 		}
 	}
 }

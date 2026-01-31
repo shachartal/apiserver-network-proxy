@@ -13,20 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# generate-pki.sh — Generate all PKI material for the overlay control plane.
+# generate-pki.sh — Generate control-plane PKI material for the overlay cluster.
+#
+# This generates the CA and all control-plane certs. Run once per environment.
+# For per-node certs (kubelet), use generate-node-pki.sh instead.
 #
 # Usage: ./generate-pki.sh <output-dir>
 #
 # Produces:
 #   ca.crt, ca.key                         — Overlay CA
 #   apiserver.crt, apiserver.key           — kube-apiserver serving cert
+#   apiserver-kubelet-client.crt/key       — apiserver→kubelet client cert
 #   sa.key, sa.pub                         — ServiceAccount signing key pair
 #   admin.crt, admin.key                   — Admin client cert (system:masters)
-#   kubelet.crt, kubelet.key               — Kubelet client cert (system:node:${NODE_ID})
 #   controller-manager.crt, controller-manager.key
 #   scheduler.crt, scheduler.key
 #   admin.kubeconfig                       — Admin kubeconfig
-#   kubelet.kubeconfig                     — Kubelet kubeconfig
 #   controller-manager.kubeconfig
 #   scheduler.kubeconfig
 
@@ -38,10 +40,6 @@ mkdir -p "$PKI_DIR"
 # The apiserver will be reachable from the VM via NodePort on the host.
 # We include common SANs; the caller can set APISERVER_EXTRA_SANS if needed.
 APISERVER_EXTRA_SANS="${APISERVER_EXTRA_SANS:-}"
-
-# The node ID used in the kubelet cert and kubeconfig.
-# Callers can set NODE_ID to override the default.
-NODE_ID="${NODE_ID:-bucket-agent-vm}"
 
 DAYS=3650
 RSA_BITS=2048
@@ -110,7 +108,7 @@ gen_kubeconfig() {
 }
 
 # ============================================================
-# Generate all certs
+# Generate all control-plane certs
 # ============================================================
 
 gen_ca
@@ -149,16 +147,16 @@ EOF
 sign_cert admin "/O=system:masters/CN=admin" -extfile "$PKI_DIR/admin-ext.cnf" -extensions v3_req
 rm -f "$PKI_DIR/admin-ext.cnf"
 
-# --- Kubelet client cert ---
-log "Generating kubelet client cert"
-cat > "$PKI_DIR/kubelet-ext.cnf" <<EOF
+# --- Apiserver-kubelet-client cert (used by apiserver to talk to kubelets) ---
+log "Generating apiserver-kubelet-client cert"
+cat > "$PKI_DIR/apiserver-kubelet-client-ext.cnf" <<EOF
 [v3_req]
 basicConstraints = CA:FALSE
 keyUsage = digitalSignature
 extendedKeyUsage = clientAuth
 EOF
-sign_cert kubelet "/O=system:nodes/CN=system:node:${NODE_ID}" -extfile "$PKI_DIR/kubelet-ext.cnf" -extensions v3_req
-rm -f "$PKI_DIR/kubelet-ext.cnf"
+sign_cert apiserver-kubelet-client "/O=system:masters/CN=apiserver-kubelet-client" -extfile "$PKI_DIR/apiserver-kubelet-client-ext.cnf" -extensions v3_req
+rm -f "$PKI_DIR/apiserver-kubelet-client-ext.cnf"
 
 # --- Controller-manager client cert ---
 log "Generating controller-manager client cert"
@@ -192,12 +190,8 @@ IN_CLUSTER_SERVER="https://kube-apiserver.overlay-system.svc:6443"
 # For admin access from the host, we'll use the NodePort
 HOST_SERVER="${APISERVER_URL:-https://127.0.0.1:30443}"
 
-# For kubelet in the VM, we'll use the host IP + NodePort
-VM_SERVER="${KUBELET_APISERVER_URL:-https://192.168.64.1:30443}"
-
 log "Generating kubeconfigs"
 gen_kubeconfig admin "$HOST_SERVER" admin
-gen_kubeconfig kubelet "$VM_SERVER" "system:node:${NODE_ID}"
 gen_kubeconfig controller-manager "$IN_CLUSTER_SERVER" "system:kube-controller-manager"
 gen_kubeconfig scheduler "$IN_CLUSTER_SERVER" "system:kube-scheduler"
 

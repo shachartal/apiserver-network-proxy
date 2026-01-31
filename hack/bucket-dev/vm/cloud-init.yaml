@@ -168,6 +168,10 @@ write_files:
         # Substitute the placeholder in systemd unit files.
         sed -i "s/NODE_ID_PLACEHOLDER/$NODE_ID/g" /etc/systemd/system/kubelet.service
         sed -i "s/NODE_ID_PLACEHOLDER/$NODE_ID/g" /etc/systemd/system/bucket-proxy-agent.service
+        # Add the node ID to /etc/hosts so the bucket-proxy-agent can resolve
+        # DIAL_REQ addresses targeting this node (apiserver uses the hostname
+        # from --hostname-override when connecting to kubelet).
+        echo "127.0.0.1 $NODE_ID" >> /etc/hosts
       else
         echo "ERROR: $BUCKET/pki/node-id not found — cannot configure services"
         exit 1
