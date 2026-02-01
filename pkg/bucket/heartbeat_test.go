@@ -18,6 +18,7 @@ package bucket
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 	"time"
 )
@@ -78,11 +79,14 @@ func TestHeartbeatStaleDetection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Publish a single heartbeat then stop the publisher.
-	pub := NewHeartbeatPublisher(ctx, store, "stale-node", 100*time.Millisecond)
-	go pub.Run()
-	time.Sleep(200 * time.Millisecond)
-	pub.Stop()
+	// Write a heartbeat file directly (simulating an agent that crashed
+	// without graceful shutdown, so its heartbeat file remains).
+	ts := time.Now().UnixMilli()
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint64(data, uint64(ts))
+	if err := store.Put(ctx, "node-to-control/stale-node/heartbeat-0000000001.hb", data); err != nil {
+		t.Fatalf("Failed to write heartbeat: %v", err)
+	}
 
 	// Monitor with a very short timeout to trigger staleness quickly.
 	staleCh := make(chan string, 1)
