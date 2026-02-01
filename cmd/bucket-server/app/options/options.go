@@ -58,6 +58,10 @@ type BucketProxyServerOptions struct {
 
 	// Keepalive for frontend gRPC connections.
 	FrontendKeepaliveTime time.Duration
+
+	// ReverseProxyTarget is the address to dial for reverse-tunneled connections
+	// (e.g., "localhost:6443"). Empty disables the reverse proxy handler.
+	ReverseProxyTarget string
 }
 
 func NewBucketProxyServerOptions() *BucketProxyServerOptions {
@@ -95,6 +99,7 @@ func (o *BucketProxyServerOptions) Flags() *pflag.FlagSet {
 	flags.IntVar(&o.WorkerCount, "worker-count", o.WorkerCount, "Number of concurrent download workers per region for the regional poller.")
 	flags.DurationVar(&o.NagleDelay, "nagle-delay", o.NagleDelay, "Coalesce small DATA packets for this duration before flushing. 0 disables.")
 	flags.DurationVar(&o.FrontendKeepaliveTime, "frontend-keepalive-time", o.FrontendKeepaliveTime, "Keepalive time for frontend gRPC connections.")
+	flags.StringVar(&o.ReverseProxyTarget, "reverse-proxy-target", o.ReverseProxyTarget, "Address to dial for reverse-tunneled connections (e.g., \"localhost:6443\"). Empty disables.")
 	return flags
 }
 
@@ -114,6 +119,7 @@ func (o *BucketProxyServerOptions) Print() {
 	klog.V(1).Infof("WorkerCount set to %d.\n", o.WorkerCount)
 	klog.V(1).Infof("NagleDelay set to %v.\n", o.NagleDelay)
 	klog.V(1).Infof("FrontendKeepaliveTime set to %v.\n", o.FrontendKeepaliveTime)
+	klog.V(1).Infof("ReverseProxyTarget set to %q.\n", o.ReverseProxyTarget)
 }
 
 func (o *BucketProxyServerOptions) Validate() error {

@@ -63,14 +63,17 @@ type BucketProxyServer struct {
 	healthServer *http.Server
 	adminServer  *http.Server
 
-	proxyServer   *server.ProxyServer
-	poller        *bucket.RegionalPoller
-	hbMonitor     *bucket.HeartbeatMonitor
-	store         bucket.Store
-	nagleDelay    time.Duration
+	proxyServer        *server.ProxyServer
+	poller             *bucket.RegionalPoller
+	reversePoller      *bucket.RegionalPoller
+	hbMonitor          *bucket.HeartbeatMonitor
+	store              bucket.Store
+	nagleDelay         time.Duration
+	reverseProxyTarget string
 
-	mu         sync.Mutex
-	transports map[string]*bucket.BucketTransport // nodeID → transport
+	mu              sync.Mutex
+	transports      map[string]*bucket.BucketTransport       // nodeID → transport
+	reverseHandlers map[string]*bucket.ReverseProxyHandler    // nodeID → reverse handler
 }
 
 func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-chan struct{}) error {
@@ -88,7 +91,9 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	}
 	p.store = store
 	p.nagleDelay = o.NagleDelay
+	p.reverseProxyTarget = o.ReverseProxyTarget
 	p.transports = make(map[string]*bucket.BucketTransport)
+	p.reverseHandlers = make(map[string]*bucket.ReverseProxyHandler)
 
 	// Create ProxyServer.
 	ps, err := proxystrategies.ParseProxyStrategies("default")
@@ -106,6 +111,14 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	p.poller = bucket.NewRegionalPoller(ctx, p.store, "node-to-control/")
 	p.poller.SetWorkerCount(o.WorkerCount)
 	go p.poller.Run()
+
+	// Start regional poller for reverse tunnel (if enabled).
+	if p.reverseProxyTarget != "" {
+		p.reversePoller = bucket.NewRegionalPoller(ctx, p.store, "node-to-control-reverse/")
+		p.reversePoller.SetWorkerCount(o.WorkerCount)
+		go p.reversePoller.Run()
+		klog.V(1).Infof("Reverse proxy enabled, target: %s", p.reverseProxyTarget)
+	}
 
 	// Start heartbeat monitor — agents are discovered dynamically.
 	p.hbMonitor = bucket.NewHeartbeatMonitor(ctx, p.store, 10*time.Second, bucket.DefaultHeartbeatTimeout)
@@ -137,6 +150,12 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 		klog.V(2).Infof("Closing transport for node %q", nodeID)
 		t.Close()
 		p.poller.UnregisterNode(nodeID)
+		if rh, ok := p.reverseHandlers[nodeID]; ok {
+			rh.Stop()
+			if p.reversePoller != nil {
+				p.reversePoller.UnregisterNode(nodeID)
+			}
+		}
 		nodeIDs = append(nodeIDs, nodeID)
 	}
 	p.mu.Unlock()
@@ -146,6 +165,9 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	}
 
 	p.poller.Stop()
+	if p.reversePoller != nil {
+		p.reversePoller.Stop()
+	}
 	p.hbMonitor.Stop()
 	if p.grpcServer != nil {
 		p.grpcServer.GracefulStop()
@@ -171,6 +193,14 @@ func (p *BucketProxyServer) registerNode(nodeID string) {
 	klog.V(1).Infof("Discovered new agent %q via heartbeat — registering", nodeID)
 	transport := bucket.RegisterBucketAgentWithPoller(p.proxyServer, p.store, nodeID, p.poller, p.nagleDelay)
 	p.transports[nodeID] = transport
+
+	// Start reverse proxy handler for this node if enabled.
+	if p.reverseProxyTarget != "" && p.reversePoller != nil {
+		rh := bucket.NewReverseProxyHandlerWithPoller(context.Background(), p.store, nodeID, p.reverseProxyTarget, p.reversePoller, p.nagleDelay)
+		p.reverseHandlers[nodeID] = rh
+		go rh.Serve()
+		klog.V(1).Infof("Started reverse proxy handler for node %q → %s", nodeID, p.reverseProxyTarget)
+	}
 }
 
 func (p *BucketProxyServer) unregisterNode(nodeID string) {
@@ -187,6 +217,15 @@ func (p *BucketProxyServer) unregisterNode(nodeID string) {
 	p.poller.UnregisterNode(nodeID)
 	delete(p.transports, nodeID)
 
+	// Stop the reverse proxy handler for this node.
+	if rh, ok := p.reverseHandlers[nodeID]; ok {
+		rh.Stop()
+		if p.reversePoller != nil {
+			p.reversePoller.UnregisterNode(nodeID)
+		}
+		delete(p.reverseHandlers, nodeID)
+	}
+
 	// Clean up stale heartbeat and data files for this node in the background.
 	go p.cleanupNodeFiles(nodeID)
 }
@@ -200,6 +239,8 @@ func (p *BucketProxyServer) cleanupNodeFiles(nodeID string) {
 	prefixes := []string{
 		"node-to-control/" + nodeID + "/",
 		"control-to-node/" + nodeID + "/",
+		"node-to-control-reverse/" + nodeID + "/",
+		"control-to-node-reverse/" + nodeID + "/",
 	}
 	for _, prefix := range prefixes {
 		keys, err := p.store.List(ctx, prefix)

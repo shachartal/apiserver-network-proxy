@@ -60,6 +60,7 @@ spec:
         - --health-port=8092
         - --admin-port=8095
         - --nagle-delay=50ms
+        - --reverse-proxy-target=localhost:6443
         - --v=4
       ports:
         - containerPort: 8092

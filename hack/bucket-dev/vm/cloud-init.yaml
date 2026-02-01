@@ -136,6 +136,7 @@ write_files:
         --node-id=NODE_ID_PLACEHOLDER \
         --poll-interval=0 \
         --nagle-delay=50ms \
+        --reverse-proxy-listen=127.0.0.1:6443 \
         --v=4
       Restart=always
       RestartSec=5
