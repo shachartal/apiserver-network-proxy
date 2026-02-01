@@ -53,6 +53,7 @@ func NewBucketAgentCommand(a *BucketProxyAgent, o *options.BucketProxyAgentOptio
 
 type BucketProxyAgent struct {
 	agent        *bucket.BucketAgent
+	reverseProxy *bucket.ReverseProxy
 	healthServer *http.Server
 	adminServer  *http.Server
 }
@@ -74,6 +75,19 @@ func (a *BucketProxyAgent) Run(o *options.BucketProxyAgentOptions, stopCh <-chan
 	// Create and start the bucket agent.
 	a.agent = bucket.NewBucketAgent(ctx, store, o.NodeID, o.PollInterval, o.NagleDelay)
 
+	// Start reverse proxy if configured.
+	if o.ReverseProxyListen != "" {
+		rp, err := bucket.NewReverseProxy(ctx, store, o.NodeID, o.ReverseProxyListen, o.PollInterval, o.NagleDelay)
+		if err != nil {
+			return fmt.Errorf("failed to create reverse proxy: %v", err)
+		}
+		a.reverseProxy = rp
+		go func() {
+			klog.V(1).Infof("Reverse proxy listening on %s", o.ReverseProxyListen)
+			rp.Serve()
+		}()
+	}
+
 	// Start health and admin servers.
 	if err := a.runHealthServer(o); err != nil {
 		return fmt.Errorf("failed to start health server: %v", err)
@@ -94,6 +108,9 @@ func (a *BucketProxyAgent) Run(o *options.BucketProxyAgentOptions, stopCh <-chan
 	select {
 	case <-stopCh:
 		klog.V(1).Infoln("Shutting down bucket proxy agent.")
+		if a.reverseProxy != nil {
+			a.reverseProxy.Stop()
+		}
 		a.agent.Stop()
 	case <-agentDone:
 		klog.V(1).Infoln("Bucket agent exited.")

@@ -44,6 +44,10 @@ type BucketProxyAgentOptions struct {
 	// 0 disables Nagle buffering (each packet is sent immediately).
 	NagleDelay time.Duration
 
+	// ReverseProxyListen is the local address to listen on for reverse proxy
+	// connections (e.g., "127.0.0.1:6443"). Empty disables the reverse proxy.
+	ReverseProxyListen string
+
 	// Health/admin ports.
 	HealthPort        int
 	HealthBindAddress string
@@ -74,6 +78,7 @@ func (o *BucketProxyAgentOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.NodeID, "node-id", o.NodeID, "Unique node ID for this agent. Can also be set via BUCKET_AGENT_NODE_ID env var.")
 	flags.DurationVar(&o.PollInterval, "poll-interval", o.PollInterval, "Bucket polling interval. 0 enables adaptive polling (100ms-5s).")
 	flags.DurationVar(&o.NagleDelay, "nagle-delay", o.NagleDelay, "Coalesce small DATA packets for this duration before flushing. 0 disables.")
+	flags.StringVar(&o.ReverseProxyListen, "reverse-proxy-listen", o.ReverseProxyListen, "Local address for reverse proxy (e.g., \"127.0.0.1:6443\"). Empty disables.")
 	flags.IntVar(&o.HealthPort, "health-port", o.HealthPort, "Port for health check endpoint.")
 	flags.StringVar(&o.HealthBindAddress, "health-bind-address", o.HealthBindAddress, "Bind address for health endpoint.")
 	flags.IntVar(&o.AdminPort, "admin-port", o.AdminPort, "Port for admin endpoint.")
@@ -89,6 +94,7 @@ func (o *BucketProxyAgentOptions) Print() {
 	klog.V(1).Infof("NodeID set to %q.\n", o.NodeID)
 	klog.V(1).Infof("PollInterval set to %v.\n", o.PollInterval)
 	klog.V(1).Infof("NagleDelay set to %v.\n", o.NagleDelay)
+	klog.V(1).Infof("ReverseProxyListen set to %q.\n", o.ReverseProxyListen)
 	klog.V(1).Infof("HealthPort set to %d.\n", o.HealthPort)
 	klog.V(1).Infof("HealthBindAddress set to %q.\n", o.HealthBindAddress)
 	klog.V(1).Infof("AdminPort set to %d.\n", o.AdminPort)

@@ -114,7 +114,7 @@ APISERVER_EXTRA_SANS="IP:${HOST_IP}" \
 
 # Generate per-node PKI (kubelet cert + kubeconfig).
 NODE_ID="$NODE_ID" \
-KUBELET_APISERVER_URL="https://${HOST_IP}:30443" \
+KUBELET_APISERVER_URL="https://127.0.0.1:6443" \
     "$SCRIPT_DIR/generate-node-pki.sh" "$PKI_DIR"
 
 # Stage public PKI files locally for upload to GCS.

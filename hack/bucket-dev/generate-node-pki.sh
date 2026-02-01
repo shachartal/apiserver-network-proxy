@@ -81,7 +81,7 @@ rm -f "$PKI_DIR/${CERT_NAME}-ext.cnf"
 
 # --- Generate kubeconfig ---
 # For kubelet in the VM, use the host IP + NodePort.
-VM_SERVER="${KUBELET_APISERVER_URL:-https://192.168.64.1:30443}"
+VM_SERVER="${KUBELET_APISERVER_URL:-https://127.0.0.1:6443}"
 
 log "Generating kubelet kubeconfig for node ${NODE_ID} (server: ${VM_SERVER})"
 KUBECONFIG_FILE="$PKI_DIR/${CERT_NAME}.kubeconfig"
