@@ -34,6 +34,7 @@ K8S_VERSION="v1.30.0"
 CONTAINERD_VERSION="1.7.20"
 RUNC_VERSION="v1.1.13"
 CNI_VERSION="v1.5.1"
+REGISTRY_VERSION="3.0.0"
 
 log() { echo "==> $*"; }
 
@@ -97,25 +98,17 @@ for ARCH in amd64 arm64; do
     download "${UBUNTU_MIRROR}/main/libn/libnetfilter-queue/libnetfilter-queue1_1.0.2-2_${ARCH}.deb" \
         "$ARCH_DIR/debs/libnetfilter-queue1_${ARCH}.deb"
 
-    # Pause image — export per-arch.
-    # docker save of cross-platform images can fail on Docker Desktop, so we
-    # use a buildx-based approach: build a trivial FROM image for the target
-    # platform and export it as an OCI tar.
-    PAUSE_TAR="$ARCH_DIR/pause.tar"
-    if [ -f "$PAUSE_TAR" ]; then
-        log "Already exported: pause.tar ($ARCH)"
-    elif command -v docker &>/dev/null; then
-        PAUSE_IMAGE="registry.k8s.io/pause:3.9"
-        log "Exporting pause image ($ARCH)..."
-        TMPCTX=$(mktemp -d)
-        echo "FROM --platform=linux/${ARCH} ${PAUSE_IMAGE}" > "$TMPCTX/Dockerfile"
-        docker buildx build --platform "linux/${ARCH}" \
-            --output "type=docker,dest=${PAUSE_TAR}" \
-            --tag "${PAUSE_IMAGE}" \
-            "$TMPCTX" 2>&1
-        rm -rf "$TMPCTX"
+    # OCI Distribution registry binary
+    REGISTRY_BIN="$ARCH_DIR/registry"
+    if [ -f "$REGISTRY_BIN" ]; then
+        log "Already downloaded: registry ($ARCH)"
     else
-        log "WARNING: docker not available, skipping pause image"
+        REGISTRY_TAR="$ARCH_DIR/registry.tar.gz"
+        download "https://github.com/distribution/distribution/releases/download/v${REGISTRY_VERSION}/registry_${REGISTRY_VERSION}_linux_${ARCH}.tar.gz" \
+            "$REGISTRY_TAR"
+        log "Extracting registry binary ($ARCH)..."
+        tar -C "$ARCH_DIR" -xzf "$REGISTRY_TAR" registry
+        rm -f "$REGISTRY_TAR"
     fi
 done
 
