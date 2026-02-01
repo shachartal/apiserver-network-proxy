@@ -76,13 +76,14 @@ type BucketAgent struct {
 }
 
 // NewBucketAgent creates a new agent that communicates via the given Store.
-func NewBucketAgent(ctx context.Context, store Store, nodeID string, pollInterval time.Duration) *BucketAgent {
+func NewBucketAgent(ctx context.Context, store Store, nodeID string, pollInterval, nagleDelay time.Duration) *BucketAgent {
 	ctx, cancel := context.WithCancel(ctx)
 	// Agent sends to node-to-control/{nodeID}/, receives from control-to-node/{nodeID}/
 	transport := NewBucketTransport(ctx, store,
 		"node-to-control/"+nodeID+"/",
 		"control-to-node/"+nodeID+"/",
 		pollInterval,
+		nagleDelay,
 	)
 	return &BucketAgent{
 		transport: transport,

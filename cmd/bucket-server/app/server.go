@@ -67,6 +67,7 @@ type BucketProxyServer struct {
 	poller        *bucket.RegionalPoller
 	hbMonitor     *bucket.HeartbeatMonitor
 	store         bucket.Store
+	nagleDelay    time.Duration
 
 	mu         sync.Mutex
 	transports map[string]*bucket.BucketTransport // nodeID → transport
@@ -86,6 +87,7 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 		return fmt.Errorf("failed to create store: %v", err)
 	}
 	p.store = store
+	p.nagleDelay = o.NagleDelay
 	p.transports = make(map[string]*bucket.BucketTransport)
 
 	// Create ProxyServer.
@@ -167,7 +169,7 @@ func (p *BucketProxyServer) registerNode(nodeID string) {
 	}
 
 	klog.V(1).Infof("Discovered new agent %q via heartbeat — registering", nodeID)
-	transport := bucket.RegisterBucketAgentWithPoller(p.proxyServer, p.store, nodeID, p.poller)
+	transport := bucket.RegisterBucketAgentWithPoller(p.proxyServer, p.store, nodeID, p.poller, p.nagleDelay)
 	p.transports[nodeID] = transport
 }
 
