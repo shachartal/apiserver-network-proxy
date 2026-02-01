@@ -128,14 +128,20 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	<-stopCh
 	klog.V(1).Infoln("Shutting down bucket proxy server.")
 
-	// Cleanup.
+	// Cleanup transports and bucket files for all tracked nodes.
 	p.mu.Lock()
+	nodeIDs := make([]string, 0, len(p.transports))
 	for nodeID, t := range p.transports {
 		klog.V(2).Infof("Closing transport for node %q", nodeID)
 		t.Close()
 		p.poller.UnregisterNode(nodeID)
+		nodeIDs = append(nodeIDs, nodeID)
 	}
 	p.mu.Unlock()
+
+	for _, nodeID := range nodeIDs {
+		p.cleanupNodeFiles(nodeID)
+	}
 
 	p.poller.Stop()
 	p.hbMonitor.Stop()

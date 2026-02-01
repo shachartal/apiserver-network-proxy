@@ -66,6 +66,7 @@ func NewHeartbeatPublisher(ctx context.Context, store Store, nodeID string, inte
 func (h *HeartbeatPublisher) Run() {
 	klog.V(2).InfoS("HeartbeatPublisher started", "nodeID", h.nodeID, "interval", h.interval)
 	defer klog.V(2).InfoS("HeartbeatPublisher stopped", "nodeID", h.nodeID)
+	defer h.cleanup()
 
 	// Publish immediately on start.
 	h.publish()
@@ -80,6 +81,24 @@ func (h *HeartbeatPublisher) Run() {
 		case <-ticker.C:
 			h.publish()
 		}
+	}
+}
+
+// cleanup deletes the current heartbeat file on shutdown so it doesn't
+// remain in the bucket after the agent exits.
+func (h *HeartbeatPublisher) cleanup() {
+	seq := h.seq.Load()
+	if seq == 0 {
+		return
+	}
+	key := fmt.Sprintf("%s%s/heartbeat-%0*d%s", heartbeatPrefix, h.nodeID, seqWidth, seq, heartbeatSuffix)
+	// Use a fresh context since h.ctx is already cancelled.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.store.Delete(ctx, key); err != nil {
+		klog.V(2).InfoS("Failed to delete heartbeat on shutdown", "nodeID", h.nodeID, "key", key, "err", err)
+	} else {
+		klog.V(2).InfoS("Deleted heartbeat on shutdown", "nodeID", h.nodeID, "key", key)
 	}
 }
 
