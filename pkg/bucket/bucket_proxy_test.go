@@ -61,11 +61,11 @@ func TestBucketProxy_EndToEnd(t *testing.T) {
 	t.Cleanup(grpcServer.Stop)
 
 	// 4. Register a bucket-backed "agent" with the ProxyServer.
-	transport := RegisterBucketAgent(ps, store, "node-1", 50*time.Millisecond)
+	transport := RegisterBucketAgent(ps, store, "node-1", 50*time.Millisecond, 0)
 	t.Cleanup(transport.Close)
 
 	// 5. Start the BucketAgent that polls the bucket and dials local endpoints.
-	agent := NewBucketAgent(context.Background(), store, "node-1", 50*time.Millisecond)
+	agent := NewBucketAgent(context.Background(), store, "node-1", 50*time.Millisecond, 0)
 	go agent.Serve()
 	t.Cleanup(agent.Stop)
 

@@ -77,7 +77,7 @@ func (s *BucketAgentStream) RecvMsg(_ interface{}) error {
 //
 // This function starts a goroutine that runs ProxyServer.Connect() — it blocks
 // until the transport is closed. Returns the transport so the caller can close it.
-func RegisterBucketAgent(ps *server.ProxyServer, store Store, nodeID string, pollInterval time.Duration) *BucketTransport {
+func RegisterBucketAgent(ps *server.ProxyServer, store Store, nodeID string, pollInterval, nagleDelay time.Duration) *BucketTransport {
 	ctx := context.Background()
 
 	// Server sends to control-to-node/{nodeID}/, receives from node-to-control/{nodeID}/
@@ -85,6 +85,7 @@ func RegisterBucketAgent(ps *server.ProxyServer, store Store, nodeID string, pol
 		"control-to-node/"+nodeID+"/",
 		"node-to-control/"+nodeID+"/",
 		pollInterval,
+		nagleDelay,
 	)
 
 	connectTransport(ps, transport, nodeID)
@@ -95,11 +96,11 @@ func RegisterBucketAgent(ps *server.ProxyServer, store Store, nodeID string, pol
 // messages from a RegionalPoller instead of polling independently. The poller
 // handles LIST operations centrally for all nodes in the region.
 // Returns a send-only BucketTransport (polling disabled; recv comes from the poller).
-func RegisterBucketAgentWithPoller(ps *server.ProxyServer, store Store, nodeID string, poller *RegionalPoller) *BucketTransport {
+func RegisterBucketAgentWithPoller(ps *server.ProxyServer, store Store, nodeID string, poller *RegionalPoller, nagleDelay time.Duration) *BucketTransport {
 	ctx := context.Background()
 
 	// Create a send-only transport (no polling — the poller handles recv).
-	sendTransport := newSendOnlyTransport(ctx, store, "control-to-node/"+nodeID+"/")
+	sendTransport := newSendOnlyTransport(ctx, store, "control-to-node/"+nodeID+"/", nagleDelay)
 
 	// Register with the poller to receive packets.
 	recvCh := poller.RegisterNode(nodeID)

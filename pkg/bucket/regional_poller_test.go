@@ -76,11 +76,11 @@ func TestRegionalPoller_EndToEnd(t *testing.T) {
 	t.Cleanup(poller.Stop)
 
 	// Register agent using the regional poller.
-	transport := RegisterBucketAgentWithPoller(ps, store, "node-1", poller)
+	transport := RegisterBucketAgentWithPoller(ps, store, "node-1", poller, 0)
 	t.Cleanup(transport.Close)
 
 	// Start the BucketAgent (node side still polls independently).
-	agent := NewBucketAgent(context.Background(), store, "node-1", 50*time.Millisecond)
+	agent := NewBucketAgent(context.Background(), store, "node-1", 50*time.Millisecond, 0)
 	go agent.Serve()
 	t.Cleanup(agent.Stop)
 

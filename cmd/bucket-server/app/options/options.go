@@ -52,6 +52,10 @@ type BucketProxyServerOptions struct {
 	// Polling configuration for the regional poller.
 	WorkerCount int
 
+	// NagleDelay coalesces small DATA packets per connection before flushing.
+	// 0 disables Nagle buffering (each packet is sent immediately).
+	NagleDelay time.Duration
+
 	// Keepalive for frontend gRPC connections.
 	FrontendKeepaliveTime time.Duration
 }
@@ -89,6 +93,7 @@ func (o *BucketProxyServerOptions) Flags() *pflag.FlagSet {
 	flags.IntVar(&o.AdminPort, "admin-port", o.AdminPort, "Port for admin/metrics endpoint.")
 	flags.StringVar(&o.AdminBindAddress, "admin-bind-address", o.AdminBindAddress, "Bind address for admin endpoint.")
 	flags.IntVar(&o.WorkerCount, "worker-count", o.WorkerCount, "Number of concurrent download workers per region for the regional poller.")
+	flags.DurationVar(&o.NagleDelay, "nagle-delay", o.NagleDelay, "Coalesce small DATA packets for this duration before flushing. 0 disables.")
 	flags.DurationVar(&o.FrontendKeepaliveTime, "frontend-keepalive-time", o.FrontendKeepaliveTime, "Keepalive time for frontend gRPC connections.")
 	return flags
 }
@@ -107,6 +112,7 @@ func (o *BucketProxyServerOptions) Print() {
 	klog.V(1).Infof("AdminPort set to %d.\n", o.AdminPort)
 	klog.V(1).Infof("AdminBindAddress set to %q.\n", o.AdminBindAddress)
 	klog.V(1).Infof("WorkerCount set to %d.\n", o.WorkerCount)
+	klog.V(1).Infof("NagleDelay set to %v.\n", o.NagleDelay)
 	klog.V(1).Infof("FrontendKeepaliveTime set to %v.\n", o.FrontendKeepaliveTime)
 }
 

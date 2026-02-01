@@ -135,6 +135,7 @@ write_files:
         --gcs-credentials-file=/etc/gcs/application_default_credentials.json \
         --node-id=NODE_ID_PLACEHOLDER \
         --poll-interval=0 \
+        --nagle-delay=50ms \
         --v=4
       Restart=always
       RestartSec=5

@@ -72,7 +72,7 @@ func (a *BucketProxyAgent) Run(o *options.BucketProxyAgentOptions, stopCh <-chan
 	}
 
 	// Create and start the bucket agent.
-	a.agent = bucket.NewBucketAgent(ctx, store, o.NodeID, o.PollInterval)
+	a.agent = bucket.NewBucketAgent(ctx, store, o.NodeID, o.PollInterval, o.NagleDelay)
 
 	// Start health and admin servers.
 	if err := a.runHealthServer(o); err != nil {
