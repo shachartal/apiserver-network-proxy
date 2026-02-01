@@ -21,11 +21,54 @@ write_files:
       version = 2
       [plugins."io.containerd.grpc.v1.cri"]
         sandbox_image = "registry.k8s.io/pause:3.9"
+        [plugins."io.containerd.grpc.v1.cri".registry]
+          config_path = "/etc/containerd/certs.d"
         [plugins."io.containerd.grpc.v1.cri".containerd]
           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
             runtime_type = "io.containerd.runc.v2"
             [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
               SystemdCgroup = true
+
+  # Containerd mirror: route all image pulls through local registry first
+  - path: /etc/containerd/certs.d/_default/hosts.toml
+    content: |
+      [host."http://127.0.0.1:5000"]
+        capabilities = ["pull", "resolve"]
+
+  # OCI Distribution registry config (read-only, GCS-backed)
+  - path: /etc/distribution/config.yml
+    content: |
+      version: 0.1
+      storage:
+        gcs:
+          bucket: GCS_BUCKET_PLACEHOLDER
+          rootdirectory: GCS_PREFIX_PLACEHOLDERimages
+        maintenance:
+          readonly:
+            enabled: true
+        redirect:
+          disable: true
+      http:
+        addr: 127.0.0.1:5000
+        debug:
+          addr: 127.0.0.1:5001
+
+  # OCI Distribution registry systemd unit
+  - path: /etc/systemd/system/bucket-registry.service
+    content: |
+      [Unit]
+      Description=OCI Distribution Registry
+      After=network.target
+      Before=kubelet.service
+
+      [Service]
+      Environment=GOOGLE_APPLICATION_CREDENTIALS=/etc/gcs/application_default_credentials.json
+      ExecStart=/usr/local/bin/registry serve /etc/distribution/config.yml
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
 
   # GCS credentials for bucket-proxy-agent (injected by setup.sh)
   - path: /etc/gcs/application_default_credentials.json
@@ -61,8 +104,9 @@ write_files:
     content: |
       [Unit]
       Description=kubelet
-      After=containerd.service
+      After=containerd.service bucket-registry.service
       Requires=containerd.service
+      Wants=bucket-registry.service
 
       [Service]
       ExecStart=/usr/local/bin/kubelet \
@@ -259,17 +303,20 @@ write_files:
         echo "WARNING: bucket-proxy-agent not found in $ARCH_DIR"
       fi
 
+      # Install OCI Distribution registry
+      echo "==> Installing registry..."
+      if [ -f "$ARCH_DIR/registry" ]; then
+        cp "$ARCH_DIR/registry" /usr/local/bin/registry
+        chmod +x /usr/local/bin/registry
+      else
+        echo "WARNING: registry binary not found in $ARCH_DIR"
+      fi
+
       # Start containerd
       echo "==> Starting containerd..."
       systemctl daemon-reload
       systemctl enable --now containerd
       sleep 3
-
-      # Import pause image if available
-      if [ -f "$ARCH_DIR/pause.tar" ]; then
-        echo "==> Importing pause image..."
-        ctr -n k8s.io images import "$ARCH_DIR/pause.tar" 2>&1 || true
-      fi
 
       # Download public PKI material from GCS.
       # The kubelet kubeconfig (containing the private key) is injected via
@@ -281,6 +328,23 @@ write_files:
       # Start services
       echo "==> Starting services..."
       systemctl daemon-reload
+
+      # Start registry and wait for readiness before kubelet
+      if [ -f /usr/local/bin/registry ]; then
+        echo "==> Starting OCI registry..."
+        systemctl enable --now bucket-registry
+        for i in $(seq 1 30); do
+          if curl -sf http://127.0.0.1:5000/v2/ >/dev/null 2>&1; then
+            echo "==> Registry is ready."
+            break
+          fi
+          if [ "$i" -eq 30 ]; then
+            echo "WARNING: Registry did not become ready in time, continuing anyway."
+          fi
+          sleep 1
+        done
+      fi
+
       if [ -f /etc/kubernetes/kubelet.kubeconfig ] && \
          [ -f /usr/local/bin/bucket-proxy-agent ]; then
         systemctl enable --now bucket-proxy-agent

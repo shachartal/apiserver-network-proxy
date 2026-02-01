@@ -61,7 +61,7 @@ esac
 # ============================================================
 log "Preflight checks"
 
-for cmd in docker k3d multipass kubectl openssl; do
+for cmd in docker k3d multipass kubectl openssl crane; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: $cmd is required but not found in PATH"
         exit 1
@@ -141,6 +141,16 @@ gcloud storage cp -r "$BUCKET_DIR/distributables" "${GCS_BASE}"
 gcloud storage cp "$BUCKET_DIR/pki/ca.crt" "${GCS_BASE}pki/ca.crt"
 
 echo "Upload complete: ${GCS_BASE}"
+
+# ============================================================
+# 4b. Push container images to bucket via temporary registry
+# ============================================================
+log "Pushing container images to bucket"
+
+GCS_CREDENTIALS_FILE="$GCS_CREDENTIALS_FILE" \
+GCS_BUCKET="$GCS_BUCKET" \
+GCS_PREFIX="$GCS_PREFIX" \
+    "$SCRIPT_DIR/push-images.sh"
 
 # ============================================================
 # 5. Create k3d cluster
