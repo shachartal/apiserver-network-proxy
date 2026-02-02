@@ -40,7 +40,7 @@ const (
 	// minPollInterval is the fastest poll rate when messages are flowing.
 	minPollInterval = 100 * time.Millisecond
 	// maxPollInterval is the slowest poll rate when idle.
-	maxPollInterval = 5 * time.Second
+	maxPollInterval = 10 * time.Second
 	// backoffMultiplier is the exponential backoff factor for idle polling.
 	backoffMultiplier = 2.0
 	// nagleMaxBytes is the maximum buffered data before a Nagle flush is forced.
