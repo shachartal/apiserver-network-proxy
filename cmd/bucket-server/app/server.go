@@ -123,7 +123,9 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	}
 
 	// Start heartbeat monitor — agents are discovered dynamically.
-	p.hbMonitor = bucket.NewHeartbeatMonitor(ctx, p.store, 10*time.Second, bucket.DefaultHeartbeatTimeout)
+	// Use the regional poller as a NodeLister to avoid redundant List calls.
+	p.hbMonitor = bucket.NewHeartbeatMonitor(ctx, p.store, 30*time.Second, bucket.DefaultHeartbeatTimeout)
+	p.hbMonitor.NodeLister = p.poller
 	p.hbMonitor.OnNodeDiscovered = func(nodeID string) {
 		p.registerNode(nodeID)
 	}

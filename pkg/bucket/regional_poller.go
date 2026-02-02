@@ -110,6 +110,19 @@ func (r *RegionalPoller) UnregisterNode(nodeID string) {
 	}
 }
 
+// KnownNodeIDs returns the list of currently registered node IDs.
+// This implements NodeLister and allows HeartbeatMonitor to skip
+// redundant List calls.
+func (r *RegionalPoller) KnownNodeIDs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ids := make([]string, 0, len(r.handlers))
+	for id := range r.handlers {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // Run starts the centralized polling loop with adaptive intervals.
 // Blocks until the context is cancelled.
 func (r *RegionalPoller) Run() {

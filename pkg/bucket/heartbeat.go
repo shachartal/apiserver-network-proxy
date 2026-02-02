@@ -133,6 +133,14 @@ func (h *HeartbeatPublisher) publish() {
 	klog.V(5).InfoS("Heartbeat published", "nodeID", h.nodeID, "seq", seq)
 }
 
+// NodeLister provides a list of known node IDs. When set on HeartbeatMonitor,
+// it avoids redundant List calls by reusing node discovery from another
+// component (e.g., RegionalPoller).
+type NodeLister interface {
+	// KnownNodeIDs returns the set of node IDs currently registered.
+	KnownNodeIDs() []string
+}
+
 // HeartbeatMonitor watches for agent heartbeats on the server side.
 // It tracks the last seen heartbeat time for each node and reports
 // nodes that have gone stale.
@@ -146,6 +154,11 @@ type HeartbeatMonitor struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// NodeLister, when set, provides the list of known nodes instead of
+	// doing a separate List call on the store. This deduplicates List
+	// operations when a RegionalPoller is already listing the same prefix.
+	NodeLister NodeLister
 
 	// OnNodeDiscovered is called when a new node's heartbeat is seen for the first time.
 	OnNodeDiscovered func(nodeID string)
@@ -223,31 +236,51 @@ func (m *HeartbeatMonitor) AliveNodes() []string {
 }
 
 func (m *HeartbeatMonitor) check() {
-	// List all node directories under node-to-control/.
-	// Each node writes heartbeats to node-to-control/{nodeID}/heartbeat-*.hb
-	// We discover nodes by listing the top-level prefix for subdirectories,
-	// then check each node's heartbeat files.
-	keys, err := m.store.List(m.ctx, heartbeatPrefix)
-	if err != nil {
-		if m.ctx.Err() != nil {
+	// Discover nodes, either from the NodeLister (avoiding redundant List
+	// calls) or by listing the bucket directly.
+	var nodeIDs []string
+	if m.NodeLister != nil {
+		nodeIDs = m.NodeLister.KnownNodeIDs()
+		// Also include nodes we already track — the NodeLister may not know
+		// about newly appearing nodes until they register, but their
+		// heartbeat files may already be in the bucket.
+		m.mu.RLock()
+		tracked := make(map[string]bool, len(m.lastSeen))
+		for id := range m.lastSeen {
+			tracked[id] = true
+		}
+		m.mu.RUnlock()
+		seen := make(map[string]bool, len(nodeIDs))
+		for _, id := range nodeIDs {
+			seen[id] = true
+		}
+		for id := range tracked {
+			if !seen[id] {
+				nodeIDs = append(nodeIDs, id)
+			}
+		}
+	} else {
+		// Fall back to listing the bucket directly.
+		keys, err := m.store.List(m.ctx, heartbeatPrefix)
+		if err != nil {
+			if m.ctx.Err() != nil {
+				return
+			}
+			klog.V(4).InfoS("HeartbeatMonitor list error", "err", err)
 			return
 		}
-		klog.V(4).InfoS("HeartbeatMonitor list error", "err", err)
-		return
+		seen := make(map[string]bool)
+		for _, key := range keys {
+			nodeID := extractNodeID(key)
+			if nodeID == "" || seen[nodeID] {
+				continue
+			}
+			seen[nodeID] = true
+			nodeIDs = append(nodeIDs, nodeID)
+		}
 	}
 
-	// The List at the top-level returns node directories (for FSStore).
-	// For each discovered node, list their heartbeat files.
-	discoveredNodes := make(map[string]bool)
-	for _, key := range keys {
-		nodeID := extractNodeID(key)
-		if nodeID == "" {
-			continue
-		}
-		if discoveredNodes[nodeID] {
-			continue
-		}
-		discoveredNodes[nodeID] = true
+	for _, nodeID := range nodeIDs {
 		m.checkNode(nodeID)
 	}
 
