@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"google.golang.org/api/option"
 	"k8s.io/klog/v2"
@@ -67,10 +68,11 @@ func (a *BucketProxyAgent) Run(o *options.BucketProxyAgentOptions, stopCh <-chan
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store, err := createStore(ctx, o)
+	rawStore, err := createStore(ctx, o)
 	if err != nil {
 		return fmt.Errorf("failed to create store: %v", err)
 	}
+	store := bucket.NewMetricsStore(rawStore)
 
 	// Create and start the bucket agent.
 	a.agent = bucket.NewBucketAgent(ctx, store, o.NodeID, o.PollInterval, o.NagleDelay)
@@ -158,6 +160,7 @@ func (a *BucketProxyAgent) runAdminServer(o *options.BucketProxyAgentOptions) er
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "ok")
 	})
+	mux.Handle("/metrics", promhttp.Handler())
 
 	a.adminServer = &http.Server{
 		Addr:              net.JoinHostPort(o.AdminBindAddress, strconv.Itoa(o.AdminPort)),
