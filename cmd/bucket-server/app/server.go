@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
@@ -85,10 +86,11 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store, err := createStore(ctx, o)
+	rawStore, err := createStore(ctx, o)
 	if err != nil {
 		return fmt.Errorf("failed to create store: %v", err)
 	}
+	store := bucket.NewMetricsStore(rawStore)
 	p.store = store
 	p.nagleDelay = o.NagleDelay
 	p.reverseProxyTarget = o.ReverseProxyTarget
@@ -328,6 +330,7 @@ func (p *BucketProxyServer) runAdminServer(o *options.BucketProxyServerOptions) 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "ok")
 	})
+	mux.Handle("/metrics", promhttp.Handler())
 
 	p.adminServer = &http.Server{
 		Addr:              net.JoinHostPort(o.AdminBindAddress, strconv.Itoa(o.AdminPort)),
