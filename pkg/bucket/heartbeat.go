@@ -133,17 +133,13 @@ func (h *HeartbeatPublisher) publish() {
 	klog.V(5).InfoS("Heartbeat published", "nodeID", h.nodeID, "seq", seq)
 }
 
-// NodeLister provides a list of known node IDs. When set on HeartbeatMonitor,
-// it avoids redundant List calls by reusing node discovery from another
-// component (e.g., RegionalPoller).
-type NodeLister interface {
-	// KnownNodeIDs returns the set of node IDs currently registered.
-	KnownNodeIDs() []string
-}
-
 // HeartbeatMonitor watches for agent heartbeats on the server side.
 // It tracks the last seen heartbeat time for each node and reports
 // nodes that have gone stale.
+//
+// Node discovery is handled passively via NotifyNodeSeen(), which is
+// called by RegionalPoller when it discovers nodes through ListRecursive.
+// This eliminates the need for HeartbeatMonitor to do its own List calls.
 type HeartbeatMonitor struct {
 	store        Store
 	pollInterval time.Duration
@@ -154,11 +150,6 @@ type HeartbeatMonitor struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
-
-	// NodeLister, when set, provides the list of known nodes instead of
-	// doing a separate List call on the store. This deduplicates List
-	// operations when a RegionalPoller is already listing the same prefix.
-	NodeLister NodeLister
 
 	// OnNodeDiscovered is called when a new node's heartbeat is seen for the first time.
 	OnNodeDiscovered func(nodeID string)
@@ -235,51 +226,37 @@ func (m *HeartbeatMonitor) AliveNodes() []string {
 	return nodes
 }
 
-func (m *HeartbeatMonitor) check() {
-	// Discover nodes, either from the NodeLister (avoiding redundant List
-	// calls) or by listing the bucket directly.
-	var nodeIDs []string
-	if m.NodeLister != nil {
-		nodeIDs = m.NodeLister.KnownNodeIDs()
-		// Also include nodes we already track — the NodeLister may not know
-		// about newly appearing nodes until they register, but their
-		// heartbeat files may already be in the bucket.
-		m.mu.RLock()
-		tracked := make(map[string]bool, len(m.lastSeen))
-		for id := range m.lastSeen {
-			tracked[id] = true
-		}
-		m.mu.RUnlock()
-		seen := make(map[string]bool, len(nodeIDs))
-		for _, id := range nodeIDs {
-			seen[id] = true
-		}
-		for id := range tracked {
-			if !seen[id] {
-				nodeIDs = append(nodeIDs, id)
-			}
-		}
-	} else {
-		// Fall back to listing the bucket directly.
-		keys, err := m.store.List(m.ctx, heartbeatPrefix)
-		if err != nil {
-			if m.ctx.Err() != nil {
-				return
-			}
-			klog.V(4).InfoS("HeartbeatMonitor list error", "err", err)
-			return
-		}
-		seen := make(map[string]bool)
-		for _, key := range keys {
-			nodeID := extractNodeID(key)
-			if nodeID == "" || seen[nodeID] {
-				continue
-			}
-			seen[nodeID] = true
-			nodeIDs = append(nodeIDs, nodeID)
+// NotifyNodeSeen is called by RegionalPoller when it discovers a node via
+// ListRecursive. This allows HeartbeatMonitor to track nodes passively
+// without doing its own List calls for node discovery.
+func (m *HeartbeatMonitor) NotifyNodeSeen(nodeID string) {
+	m.mu.Lock()
+	_, known := m.lastSeen[nodeID]
+	if !known {
+		// Initialize with current time; checkNode will update with actual heartbeat timestamp.
+		m.lastSeen[nodeID] = time.Now()
+	}
+	m.mu.Unlock()
+
+	if !known {
+		klog.V(2).InfoS("New node discovered via RegionalPoller", "nodeID", nodeID)
+		if m.OnNodeDiscovered != nil {
+			m.OnNodeDiscovered(nodeID)
 		}
 	}
+}
 
+func (m *HeartbeatMonitor) check() {
+	// Get the list of known nodes. RegionalPoller discovers new nodes and
+	// notifies us via NotifyNodeSeen, so we don't need to do discovery here.
+	m.mu.RLock()
+	nodeIDs := make([]string, 0, len(m.lastSeen))
+	for id := range m.lastSeen {
+		nodeIDs = append(nodeIDs, id)
+	}
+	m.mu.RUnlock()
+
+	// Check heartbeat for each known node.
 	for _, nodeID := range nodeIDs {
 		m.checkNode(nodeID)
 	}

@@ -31,9 +31,12 @@ import (
 
 // RegionalPoller performs centralized polling for a region on the server side.
 // Instead of each per-node BucketTransport polling independently, a single
-// RegionalPoller does one LIST per poll interval on the response prefix
+// RegionalPoller does one ListRecursive per poll interval on the response prefix
 // (node-to-control/) and dispatches discovered messages to the appropriate
 // node handler. This dramatically reduces bucket API calls at scale.
+//
+// The poller also discovers new nodes by parsing paths from the recursive list,
+// which allows HeartbeatMonitor to operate passively without its own List calls.
 type RegionalPoller struct {
 	store  Store
 	prefix string // e.g. "node-to-control/"
@@ -44,6 +47,10 @@ type RegionalPoller struct {
 	// workerCount controls how many concurrent GET requests are made
 	// after LIST discovery. Defaults to DefaultWorkerCount.
 	workerCount int
+
+	// OnNodeDiscovered is called when a new node is seen for the first time.
+	// This allows HeartbeatMonitor to learn about nodes passively.
+	OnNodeDiscovered func(nodeID string)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -110,19 +117,6 @@ func (r *RegionalPoller) UnregisterNode(nodeID string) {
 	}
 }
 
-// KnownNodeIDs returns the list of currently registered node IDs.
-// This implements NodeLister and allows HeartbeatMonitor to skip
-// redundant List calls.
-func (r *RegionalPoller) KnownNodeIDs() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	ids := make([]string, 0, len(r.handlers))
-	for id := range r.handlers {
-		ids = append(ids, id)
-	}
-	return ids
-}
-
 // Run starts the centralized polling loop with adaptive intervals.
 // Blocks until the context is cancelled.
 func (r *RegionalPoller) Run() {
@@ -168,8 +162,8 @@ type messageRef struct {
 }
 
 func (r *RegionalPoller) pollOnce() bool {
-	// Discover all node directories under the prefix.
-	topKeys, err := r.store.List(r.ctx, r.prefix)
+	// Use ListRecursive to get all files in one API call instead of N+1 calls.
+	allKeys, err := r.store.ListRecursive(r.ctx, r.prefix)
 	if err != nil {
 		if r.ctx.Err() != nil {
 			return false
@@ -178,43 +172,57 @@ func (r *RegionalPoller) pollOnce() bool {
 		return false
 	}
 
-	// Collect message refs from all nodes.
+	// Collect message refs and discover new nodes.
 	var refs []messageRef
+	discoveredNodes := make(map[string]bool)
+
 	r.mu.RLock()
-	for _, key := range topKeys {
-		nodeID := extractNodeIDFromPrefixedKey(r.prefix, key)
-		if nodeID == "" {
+	for _, key := range allKeys {
+		// Parse path like "node-to-control/node-1/00000001.pb"
+		nodeID, filename := parseNodeAndFile(r.prefix, key)
+		if nodeID == "" || filename == "" {
 			continue
 		}
+
+		// Track discovered nodes for OnNodeDiscovered callback.
+		discoveredNodes[nodeID] = true
+
+		// Skip heartbeat files — they're handled by HeartbeatMonitor.
+		if isHeartbeatFile(filename) {
+			continue
+		}
+
+		// Skip if we don't have a handler for this node yet.
 		h, ok := r.handlers[nodeID]
 		if !ok {
 			continue
 		}
 
-		nodePrefix := r.prefix + nodeID + "/"
-		nodeKeys, err := r.store.List(r.ctx, nodePrefix)
+		seq, err := parseSeqFromKey(key)
 		if err != nil {
-			if r.ctx.Err() != nil {
-				r.mu.RUnlock()
-				return false
-			}
 			continue
 		}
-
-		for _, nk := range nodeKeys {
-			seq, err := parseSeqFromKey(nk)
-			if err != nil {
-				continue
-			}
-			if seq <= h.recvSeq {
-				// Already processed; queue for deletion.
-				_ = r.store.Delete(r.ctx, nk)
-				continue
-			}
-			refs = append(refs, messageRef{nodeID: nodeID, key: nk, seq: seq})
+		if seq <= h.recvSeq {
+			// Already processed; queue for deletion.
+			_ = r.store.Delete(r.ctx, key)
+			continue
 		}
+		refs = append(refs, messageRef{nodeID: nodeID, key: key, seq: seq})
 	}
 	r.mu.RUnlock()
+
+	// Notify about newly discovered nodes.
+	if r.OnNodeDiscovered != nil {
+		r.mu.RLock()
+		for nodeID := range discoveredNodes {
+			if _, known := r.handlers[nodeID]; !known {
+				r.mu.RUnlock()
+				r.OnNodeDiscovered(nodeID)
+				r.mu.RLock()
+			}
+		}
+		r.mu.RUnlock()
+	}
 
 	if len(refs) == 0 {
 		return false
@@ -223,6 +231,22 @@ func (r *RegionalPoller) pollOnce() bool {
 	// Download and dispatch messages using a worker pool.
 	r.downloadAndDispatch(refs)
 	return true
+}
+
+// parseNodeAndFile extracts the node ID and filename from a full key path.
+// For "node-to-control/node-1/00000001.pb", returns ("node-1", "00000001.pb").
+func parseNodeAndFile(prefix, key string) (nodeID, filename string) {
+	rest := strings.TrimPrefix(key, prefix)
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	return parts[0], parts[1]
+}
+
+// isHeartbeatFile returns true if the filename is a heartbeat file.
+func isHeartbeatFile(filename string) bool {
+	return strings.HasSuffix(filename, heartbeatSuffix)
 }
 
 func (r *RegionalPoller) downloadAndDispatch(refs []messageRef) {

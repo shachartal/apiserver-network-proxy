@@ -109,23 +109,8 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 		return fmt.Errorf("failed to start frontend server: %v", err)
 	}
 
-	// Start regional poller for centralized bucket polling.
-	p.poller = bucket.NewRegionalPoller(ctx, p.store, "node-to-control/")
-	p.poller.SetWorkerCount(o.WorkerCount)
-	go p.poller.Run()
-
-	// Start regional poller for reverse tunnel (if enabled).
-	if p.reverseProxyTarget != "" {
-		p.reversePoller = bucket.NewRegionalPoller(ctx, p.store, "node-to-control-reverse/")
-		p.reversePoller.SetWorkerCount(o.WorkerCount)
-		go p.reversePoller.Run()
-		klog.V(1).Infof("Reverse proxy enabled, target: %s", p.reverseProxyTarget)
-	}
-
-	// Start heartbeat monitor — agents are discovered dynamically.
-	// Use the regional poller as a NodeLister to avoid redundant List calls.
+	// Start heartbeat monitor first — it will receive node discovery events from the poller.
 	p.hbMonitor = bucket.NewHeartbeatMonitor(ctx, p.store, 30*time.Second, bucket.DefaultHeartbeatTimeout)
-	p.hbMonitor.NodeLister = p.poller
 	p.hbMonitor.OnNodeDiscovered = func(nodeID string) {
 		p.registerNode(nodeID)
 	}
@@ -133,6 +118,27 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 		p.unregisterNode(nodeID)
 	}
 	go p.hbMonitor.Run()
+
+	// Start regional poller for centralized bucket polling.
+	// Wire up node discovery to HeartbeatMonitor so it doesn't need its own List calls.
+	p.poller = bucket.NewRegionalPoller(ctx, p.store, "node-to-control/")
+	p.poller.SetWorkerCount(o.WorkerCount)
+	p.poller.OnNodeDiscovered = func(nodeID string) {
+		p.hbMonitor.NotifyNodeSeen(nodeID)
+	}
+	go p.poller.Run()
+
+	// Start regional poller for reverse tunnel (if enabled).
+	if p.reverseProxyTarget != "" {
+		p.reversePoller = bucket.NewRegionalPoller(ctx, p.store, "node-to-control-reverse/")
+		p.reversePoller.SetWorkerCount(o.WorkerCount)
+		// Reverse poller also discovers nodes; share the notification.
+		p.reversePoller.OnNodeDiscovered = func(nodeID string) {
+			p.hbMonitor.NotifyNodeSeen(nodeID)
+		}
+		go p.reversePoller.Run()
+		klog.V(1).Infof("Reverse proxy enabled, target: %s", p.reverseProxyTarget)
+	}
 
 	// Start health and admin servers.
 	if err := p.runHealthServer(o); err != nil {

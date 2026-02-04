@@ -189,3 +189,64 @@ func TestGCSStore_Integration_List(t *testing.T) {
 		t.Errorf("listed2[1] = %q, want %q", listed2[1], "node-to-control/n1/002.pb")
 	}
 }
+
+func TestGCSStore_Integration_ListRecursive(t *testing.T) {
+	bucketName := skipUnlessGCSBucket(t)
+	ctx := context.Background()
+
+	var opts []option.ClientOption
+	if creds := os.Getenv("BUCKET_TEST_GCS_CREDENTIALS"); creds != "" {
+		opts = append(opts, option.WithCredentialsFile(creds))
+	}
+
+	store, err := NewGCSStore(ctx, bucketName, "test-list-recursive/", opts...)
+	if err != nil {
+		t.Fatalf("NewGCSStore: %v", err)
+	}
+	defer store.Close()
+
+	// Setup: write objects in two "directories"
+	keys := []string{
+		"node-to-control/n1/001.pb",
+		"node-to-control/n1/002.pb",
+		"node-to-control/n2/001.pb",
+	}
+	for _, k := range keys {
+		if err := store.Put(ctx, k, []byte("data")); err != nil {
+			t.Fatalf("Put(%q): %v", k, err)
+		}
+	}
+
+	// Cleanup after test
+	defer func() {
+		for _, k := range keys {
+			store.Delete(ctx, k)
+		}
+	}()
+
+	// ListRecursive should return all 3 files in one call (no delimiter)
+	listed, err := store.ListRecursive(ctx, "node-to-control/")
+	if err != nil {
+		t.Fatalf("ListRecursive: %v", err)
+	}
+
+	if len(listed) != 3 {
+		t.Fatalf("ListRecursive returned %d items, want 3: %v", len(listed), listed)
+	}
+
+	// Verify the full paths are returned
+	expected := map[string]bool{
+		"node-to-control/n1/001.pb": true,
+		"node-to-control/n1/002.pb": true,
+		"node-to-control/n2/001.pb": true,
+	}
+	for _, k := range listed {
+		if !expected[k] {
+			t.Errorf("unexpected key %q", k)
+		}
+		delete(expected, k)
+	}
+	if len(expected) > 0 {
+		t.Errorf("missing keys: %v", expected)
+	}
+}

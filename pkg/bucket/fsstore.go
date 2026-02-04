@@ -81,6 +81,45 @@ func (s *FSStore) List(_ context.Context, prefix string) ([]string, error) {
 	return keys, nil
 }
 
+func (s *FSStore) ListRecursive(_ context.Context, prefix string) ([]string, error) {
+	dir := filepath.Join(s.root, filepath.FromSlash(prefix))
+
+	info, err := os.Stat(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("prefix %q is not a directory", prefix)
+	}
+
+	var keys []string
+	err = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// Skip directories — only return files.
+		if d.IsDir() {
+			return nil
+		}
+		// Convert to relative key with forward slashes.
+		rel, err := filepath.Rel(s.root, path)
+		if err != nil {
+			return err
+		}
+		keys = append(keys, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Strings(keys)
+	return keys, nil
+}
+
 func (s *FSStore) Delete(_ context.Context, key string) error {
 	path := filepath.Join(s.root, filepath.FromSlash(key))
 	err := os.Remove(path)

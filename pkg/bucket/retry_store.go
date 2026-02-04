@@ -85,6 +85,16 @@ func (s *RetryStore) List(ctx context.Context, prefix string) ([]string, error) 
 	return result, err
 }
 
+func (s *RetryStore) ListRecursive(ctx context.Context, prefix string) ([]string, error) {
+	var result []string
+	err := s.retry(ctx, "ListRecursive", prefix, func() error {
+		var err error
+		result, err = s.inner.ListRecursive(ctx, prefix)
+		return err
+	})
+	return result, err
+}
+
 func (s *RetryStore) Delete(ctx context.Context, key string) error {
 	return s.retry(ctx, "Delete", key, func() error {
 		return s.inner.Delete(ctx, key)
