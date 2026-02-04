@@ -128,6 +128,33 @@ func (s *GCSStore) List(ctx context.Context, prefix string) ([]string, error) {
 	return keys, nil
 }
 
+func (s *GCSStore) ListRecursive(ctx context.Context, prefix string) ([]string, error) {
+	gcsPrefix := s.objectName(prefix)
+	// No Delimiter — returns all objects recursively under the prefix.
+	query := &storage.Query{
+		Prefix: gcsPrefix,
+	}
+
+	var keys []string
+	it := s.client.Bucket(s.bucket).Objects(ctx, query)
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("listing GCS objects recursively with prefix %q: %w", gcsPrefix, err)
+		}
+
+		// Without Delimiter, attrs.Name contains the full object path.
+		key := strings.TrimPrefix(attrs.Name, s.prefix)
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+	return keys, nil
+}
+
 func (s *GCSStore) Delete(ctx context.Context, key string) error {
 	obj := s.client.Bucket(s.bucket).Object(s.objectName(key))
 	err := obj.Delete(ctx)

@@ -38,6 +38,11 @@ func TestHeartbeatPublishAndMonitor(t *testing.T) {
 	go mon.Run()
 	defer mon.Stop()
 
+	// Simulate RegionalPoller discovering the node via NotifyNodeSeen.
+	// In production, this is called by RegionalPoller.OnNodeDiscovered.
+	time.Sleep(150 * time.Millisecond) // Let publisher write at least one heartbeat
+	mon.NotifyNodeSeen("node-1")
+
 	// Wait for at least one heartbeat to be published and detected.
 	deadline := time.After(5 * time.Second)
 	for {
@@ -99,6 +104,9 @@ func TestHeartbeatStaleDetection(t *testing.T) {
 	}
 	go mon.Run()
 	defer mon.Stop()
+
+	// Simulate RegionalPoller discovering the node via NotifyNodeSeen.
+	mon.NotifyNodeSeen("stale-node")
 
 	// Wait for stale detection.
 	select {

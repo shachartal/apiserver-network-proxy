@@ -23,6 +23,7 @@
 # Prerequisites:
 #   - docker, k3d, multipass, kubectl, openssl
 #   - Run 'make build-bucket-linux' first to build the linux binaries
+#   - Run './upload-distributables.sh' once to upload kubelet, containerd, etc. to GCS
 #
 # Environment variables:
 #   GCS_CREDENTIALS_FILE — path to GCS credentials JSON file (required)
@@ -89,15 +90,24 @@ fi
 # ============================================================
 log "Creating staging directory"
 
-mkdir -p "$BUCKET_DIR"/{control-to-node,node-to-control,distributables}
+mkdir -p "$BUCKET_DIR"/{control-to-node,node-to-control}
 mkdir -p "$PKI_DIR"
 
 # ============================================================
-# 2. Download distributables (runs on host, has internet)
+# 2. Check that distributables exist in GCS
 # ============================================================
-log "Preparing distributables for air-gapped VM"
+log "Checking distributables in GCS"
 
-"$SCRIPT_DIR/prepare-distributables.sh" "$BUCKET_DIR"
+export CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$GCS_CREDENTIALS_FILE"
+GCS_BASE="gs://${GCS_BUCKET}/${GCS_PREFIX}"
+
+SENTINEL="${GCS_BASE}distributables/.uploaded"
+if ! gcloud storage ls "$SENTINEL" &>/dev/null; then
+    echo "ERROR: Distributables not found in GCS."
+    echo "Run ./upload-distributables.sh first to upload kubelet, containerd, etc."
+    exit 1
+fi
+echo "Distributables found in GCS."
 
 # ============================================================
 # 3. Generate PKI
@@ -126,31 +136,14 @@ echo "$NODE_ID" > "$BUCKET_DIR/pki/node-id"
 KUBELET_KUBECONFIG="$PKI_DIR/kubelet-${NODE_ID}.kubeconfig"
 
 # ============================================================
-# 4. Upload distributables and PKI to GCS
+# 4. Upload PKI to GCS
 # ============================================================
-log "Uploading distributables and PKI to GCS"
+log "Uploading PKI to GCS"
 
-GCS_BASE="gs://${GCS_BUCKET}/${GCS_PREFIX}"
-
-# Use the credentials file for gcloud.
-export CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$GCS_CREDENTIALS_FILE"
-
-# Upload distributables.
-gcloud storage cp -r "$BUCKET_DIR/distributables" "${GCS_BASE}"
 # Upload only the public CA cert. Private keys and node-id are injected via cloud-init.
 gcloud storage cp "$BUCKET_DIR/pki/ca.crt" "${GCS_BASE}pki/ca.crt"
 
-echo "Upload complete: ${GCS_BASE}"
-
-# ============================================================
-# 4b. Push container images to bucket via temporary registry
-# ============================================================
-log "Pushing container images to bucket"
-
-GCS_CREDENTIALS_FILE="$GCS_CREDENTIALS_FILE" \
-GCS_BUCKET="$GCS_BUCKET" \
-GCS_PREFIX="$GCS_PREFIX" \
-    "$SCRIPT_DIR/push-images.sh"
+echo "PKI upload complete."
 
 # ============================================================
 # 5. Create k3d cluster
@@ -369,5 +362,11 @@ echo ""
 echo "# SSH into VM:"
 echo "  multipass shell $VM_NAME"
 echo ""
-echo "# Tear down everything:"
+echo "# Redeploy bucket-proxy-server (after code changes):"
+echo "  $SCRIPT_DIR/redeploy-server.sh"
+echo ""
+echo "# Tear down cluster and VM (preserves GCS distributables):"
 echo "  $SCRIPT_DIR/teardown.sh"
+echo ""
+echo "# Upload distributables to GCS (run once or when deps change):"
+echo "  $SCRIPT_DIR/upload-distributables.sh"

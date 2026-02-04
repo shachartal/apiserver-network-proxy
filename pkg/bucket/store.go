@@ -27,8 +27,13 @@ type Store interface {
 	// Get reads the data stored at the given key.
 	Get(ctx context.Context, key string) ([]byte, error)
 
-	// List returns all keys with the given prefix, sorted lexicographically.
+	// List returns immediate children under the given prefix (one level only).
+	// For GCS, this uses Delimiter="/" to return only direct children.
 	List(ctx context.Context, prefix string) ([]string, error)
+
+	// ListRecursive returns all keys with the given prefix, recursively.
+	// Unlike List, this returns the full path of every object, not just immediate children.
+	ListRecursive(ctx context.Context, prefix string) ([]string, error)
 
 	// Delete removes the object at the given key.
 	Delete(ctx context.Context, key string) error

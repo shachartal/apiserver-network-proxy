@@ -167,3 +167,22 @@ func (s *MetricsStore) Delete(ctx context.Context, key string) error {
 	storeOperationDurationSeconds.WithLabelValues("delete").Observe(duration.Seconds())
 	return err
 }
+
+func (s *MetricsStore) ListRecursive(ctx context.Context, prefix string) ([]string, error) {
+	start := time.Now()
+	keys, err := s.inner.ListRecursive(ctx, prefix)
+	duration := time.Since(start)
+
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+
+	// ListRecursive is still a Class A operation (objects.list)
+	storeOperationsTotal.WithLabelValues("list_recursive", "A", status).Inc()
+	storeOperationDurationSeconds.WithLabelValues("list_recursive").Observe(duration.Seconds())
+	if err == nil {
+		storeListKeysTotal.Add(float64(len(keys)))
+	}
+	return keys, err
+}
