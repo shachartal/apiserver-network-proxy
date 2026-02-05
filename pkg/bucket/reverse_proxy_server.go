@@ -52,11 +52,11 @@ type ReverseProxyHandler struct {
 // NewReverseProxyHandler creates a server-side reverse proxy handler.
 // It creates its own BucketTransport with reverse-direction prefixes:
 //   - Receives from: node-to-control-reverse/{nodeID}/
-//   - Sends to:      control-to-node-reverse/{nodeID}/
+//   - Sends to:      control-to-node/{nodeID}/rev/
 func NewReverseProxyHandler(ctx context.Context, store Store, nodeID, targetAddr string, pollInterval, nagleDelay time.Duration) *ReverseProxyHandler {
 	ctx, cancel := context.WithCancel(ctx)
 	transport := NewBucketTransport(ctx, store,
-		"control-to-node-reverse/"+nodeID+"/",
+		"control-to-node/"+nodeID+"/rev/",
 		"node-to-control-reverse/"+nodeID+"/",
 		pollInterval,
 		nagleDelay,
@@ -75,7 +75,7 @@ func NewReverseProxyHandler(ctx context.Context, store Store, nodeID, targetAddr
 // that receives packets from a RegionalPoller instead of polling independently.
 func NewReverseProxyHandlerWithPoller(ctx context.Context, store Store, nodeID, targetAddr string, poller *RegionalPoller, nagleDelay time.Duration) *ReverseProxyHandler {
 	ctx, cancel := context.WithCancel(ctx)
-	sendTransport := newSendOnlyTransport(ctx, store, "control-to-node-reverse/"+nodeID+"/", nagleDelay)
+	sendTransport := newSendOnlyTransport(ctx, store, "control-to-node/"+nodeID+"/rev/", nagleDelay)
 
 	recvCh := poller.RegisterNode(nodeID)
 	go func() {

@@ -22,7 +22,7 @@
 #   ./benchmark-costs.sh
 #
 # Environment variables:
-#   BENCHMARK_DURATION  — total benchmark duration in seconds (default: 3600)
+#   BENCHMARK_DURATION  — total benchmark duration in seconds (default: 600)
 #   SAMPLE_INTERVAL     — seconds between metric snapshots (default: 60)
 #   VM_NAME             — multipass VM name (default: bucket-agent-vm)
 #   NAMESPACE           — kubernetes namespace (default: overlay-system)
@@ -31,7 +31,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-BENCHMARK_DURATION="${BENCHMARK_DURATION:-3600}"
+BENCHMARK_DURATION="${BENCHMARK_DURATION:-600}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-60}"
 VM_NAME="${VM_NAME:-bucket-agent-vm}"
 NAMESPACE="${NAMESPACE:-overlay-system}"

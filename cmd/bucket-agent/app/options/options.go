@@ -76,7 +76,7 @@ func (o *BucketProxyAgentOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.GCSPrefix, "gcs-prefix", o.GCSPrefix, "Optional key prefix within the GCS bucket.")
 	flags.StringVar(&o.GCSCredentialsFile, "gcs-credentials-file", o.GCSCredentialsFile, "Path to GCS service account key file. Empty uses application default credentials.")
 	flags.StringVar(&o.NodeID, "node-id", o.NodeID, "Unique node ID for this agent. Can also be set via BUCKET_AGENT_NODE_ID env var.")
-	flags.DurationVar(&o.PollInterval, "poll-interval", o.PollInterval, "Bucket polling interval. 0 enables adaptive polling (100ms-5s).")
+	flags.DurationVar(&o.PollInterval, "poll-interval", o.PollInterval, "Bucket polling interval. 0 enables adaptive polling (500ms-10s).")
 	flags.DurationVar(&o.NagleDelay, "nagle-delay", o.NagleDelay, "Coalesce small DATA packets for this duration before flushing. 0 disables.")
 	flags.StringVar(&o.ReverseProxyListen, "reverse-proxy-listen", o.ReverseProxyListen, "Local address for reverse proxy (e.g., \"127.0.0.1:6443\"). Empty disables.")
 	flags.IntVar(&o.HealthPort, "health-port", o.HealthPort, "Port for health check endpoint.")

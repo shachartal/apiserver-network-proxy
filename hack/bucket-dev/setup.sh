@@ -296,23 +296,15 @@ multipass launch 22.04 \
     --cloud-init "$RENDERED_CLOUD_INIT"
 rm -f "$RENDERED_CLOUD_INIT"
 
-echo "Waiting for cloud-init to complete..."
+echo "Waiting for cloud-init to complete (installs binaries and starts services)..."
 multipass exec "$VM_NAME" -- cloud-init status --wait || true
 
-# ============================================================
-# 10. Install binaries, PKI, and start services from GCS
-# ============================================================
-log "Installing binaries and starting services in VM"
-
-multipass exec "$VM_NAME" -- sudo /usr/local/bin/install-from-bucket.sh
-
-echo "Waiting for services to start..."
-sleep 5
+echo "Verifying services..."
 multipass exec "$VM_NAME" -- sudo systemctl status bucket-proxy-agent --no-pager || true
 multipass exec "$VM_NAME" -- sudo systemctl status kubelet --no-pager || true
 
 # ============================================================
-# 11. Wait for node registration
+# 10. Wait for node registration
 # ============================================================
 log "Waiting for node to register with overlay apiserver"
 

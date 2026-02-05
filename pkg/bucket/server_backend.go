@@ -80,9 +80,9 @@ func (s *BucketAgentStream) RecvMsg(_ interface{}) error {
 func RegisterBucketAgent(ps *server.ProxyServer, store Store, nodeID string, pollInterval, nagleDelay time.Duration) *BucketTransport {
 	ctx := context.Background()
 
-	// Server sends to control-to-node/{nodeID}/, receives from node-to-control/{nodeID}/
+	// Server sends to control-to-node/{nodeID}/fwd/, receives from node-to-control/{nodeID}/
 	transport := NewBucketTransport(ctx, store,
-		"control-to-node/"+nodeID+"/",
+		"control-to-node/"+nodeID+"/fwd/",
 		"node-to-control/"+nodeID+"/",
 		pollInterval,
 		nagleDelay,
@@ -100,7 +100,7 @@ func RegisterBucketAgentWithPoller(ps *server.ProxyServer, store Store, nodeID s
 	ctx := context.Background()
 
 	// Create a send-only transport (no polling — the poller handles recv).
-	sendTransport := newSendOnlyTransport(ctx, store, "control-to-node/"+nodeID+"/", nagleDelay)
+	sendTransport := newSendOnlyTransport(ctx, store, "control-to-node/"+nodeID+"/fwd/", nagleDelay)
 
 	// Register with the poller to receive packets.
 	recvCh := poller.RegisterNode(nodeID)

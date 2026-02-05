@@ -38,7 +38,7 @@ const (
 	// fileSuffix is the extension for bucket message files.
 	fileSuffix = ".pb"
 	// minPollInterval is the fastest poll rate when messages are flowing.
-	minPollInterval = 100 * time.Millisecond
+	minPollInterval = 500 * time.Millisecond
 	// maxPollInterval is the slowest poll rate when idle.
 	maxPollInterval = 10 * time.Second
 	// backoffMultiplier is the exponential backoff factor for idle polling.
@@ -80,7 +80,7 @@ type nagleBuffer struct {
 }
 
 // NewBucketTransport creates a transport that sends to sendPrefix and receives from recvPrefix.
-// If pollInterval is 0, adaptive polling is enabled (100ms–5s based on activity).
+// If pollInterval is 0, adaptive polling is enabled (500ms–10s based on activity).
 // If nagleDelay is > 0, small DATA packets are coalesced and flushed after the delay.
 func NewBucketTransport(ctx context.Context, store Store, sendPrefix, recvPrefix string, pollInterval, nagleDelay time.Duration) *BucketTransport {
 	adaptive := pollInterval == 0

@@ -5,7 +5,8 @@
 #   GCS credentials, kubelet kubeconfig, GCS bucket/prefix, node ID
 #
 # The VM is air-gapped (no internet access, only GCS bucket access).
-# install-from-bucket.sh uses curl + GCS REST API to download distributables.
+# install-from-bucket.sh runs automatically via runcmd and uses curl + GCS
+# REST API to download distributables, install binaries, and start services.
 
 package_update: false
 manage_etc_hosts: false
@@ -13,6 +14,7 @@ manage_etc_hosts: false
 runcmd:
   - mkdir -p /etc/kubernetes/pki
   - echo "127.0.0.1 NODE_ID_PLACEHOLDER" >> /etc/hosts
+  - /usr/local/bin/install-from-bucket.sh
 
 write_files:
   # containerd config

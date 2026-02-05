@@ -79,20 +79,20 @@ func (rc *reverseConn) close() {
 }
 
 // NewReverseProxy creates a new agent-side reverse proxy.
-// It creates its own BucketTransport with reverse-direction prefixes:
+// The transport is send-only; receive is handled by an AgentPoller that pushes
+// to the transport's recvCh via a consolidated ListRecursive.
 //   - Sends to:      node-to-control-reverse/{nodeID}/
-//   - Receives from: control-to-node-reverse/{nodeID}/
-func NewReverseProxy(ctx context.Context, store Store, nodeID, listenAddr string, pollInterval, nagleDelay time.Duration) (*ReverseProxy, error) {
+//   - Receives from: control-to-node/{nodeID}/rev/ (via AgentPoller)
+func NewReverseProxy(ctx context.Context, store Store, nodeID, listenAddr string, nagleDelay time.Duration) (*ReverseProxy, error) {
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	transport := NewBucketTransport(ctx, store,
+	// Send-only transport; recv is fed by AgentPoller.
+	transport := newSendOnlyTransport(ctx, store,
 		"node-to-control-reverse/"+nodeID+"/",
-		"control-to-node-reverse/"+nodeID+"/",
-		pollInterval,
 		nagleDelay,
 	)
 
@@ -107,6 +107,12 @@ func NewReverseProxy(ctx context.Context, store Store, nodeID, listenAddr string
 	}
 
 	return rp, nil
+}
+
+// Transport returns the underlying BucketTransport, allowing an AgentPoller
+// to push received packets into the transport's receive channel.
+func (rp *ReverseProxy) Transport() *BucketTransport {
+	return rp.transport
 }
 
 // Serve starts the accept loop and recv loop. Blocks until the context is cancelled.

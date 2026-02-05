@@ -62,12 +62,16 @@ fetch_server_metrics() {
 
 # Extract a counter value from prometheus text format.
 # Usage: extract_counter <metrics_text> <operation> <status>
+# Uses exact matching for operation names to avoid "list" matching "list_recursive".
 extract_counter() {
     local metrics="$1" operation="$2" status="${3:-success}"
-    echo "$metrics" | grep "^konnectivity_network_proxy_bucket_store_operations_total{" | \
+    local val
+    val=$(echo "$metrics" | grep "^konnectivity_network_proxy_bucket_store_operations_total{" | \
         grep "operation=\"${operation}\"" | \
+        grep -v "operation=\"${operation}_" | \
         grep "status=\"${status}\"" | \
-        awk '{print $NF}' | head -1
+        awk '{print $NF}' | head -1 || true)
+    echo "${val:-0}"
 }
 
 # Multiply operations by cost rate. Usage: calc_cost <ops> <price_per_10k>
@@ -116,33 +120,39 @@ echo "------------------------------------------------------------"
 
 agent_put=$(extract_counter "$agent_metrics" "put" "success")
 agent_list=$(extract_counter "$agent_metrics" "list" "success")
+agent_list_recursive=$(extract_counter "$agent_metrics" "list_recursive" "success")
 agent_get=$(extract_counter "$agent_metrics" "get" "success")
 agent_delete=$(extract_counter "$agent_metrics" "delete" "success")
-agent_put=${agent_put:-0}; agent_list=${agent_list:-0}; agent_get=${agent_get:-0}; agent_delete=${agent_delete:-0}
+agent_put=${agent_put:-0}; agent_list=${agent_list:-0}; agent_list_recursive=${agent_list_recursive:-0}; agent_get=${agent_get:-0}; agent_delete=${agent_delete:-0}
 # Truncate to integer
-agent_put=${agent_put%.*}; agent_list=${agent_list%.*}; agent_get=${agent_get%.*}; agent_delete=${agent_delete%.*}
-agent_total=$((agent_put + agent_list + agent_get + agent_delete))
+agent_put=${agent_put%.*}; agent_list=${agent_list%.*}; agent_list_recursive=${agent_list_recursive%.*}; agent_get=${agent_get%.*}; agent_delete=${agent_delete%.*}
+# Combine list and list_recursive (both Class A operations)
+agent_list_all=$((agent_list + agent_list_recursive))
+agent_total=$((agent_put + agent_list_all + agent_get + agent_delete))
 
 server_put=$(extract_counter "$server_metrics" "put" "success")
 server_list=$(extract_counter "$server_metrics" "list" "success")
+server_list_recursive=$(extract_counter "$server_metrics" "list_recursive" "success")
 server_get=$(extract_counter "$server_metrics" "get" "success")
 server_delete=$(extract_counter "$server_metrics" "delete" "success")
-server_put=${server_put:-0}; server_list=${server_list:-0}; server_get=${server_get:-0}; server_delete=${server_delete:-0}
-server_put=${server_put%.*}; server_list=${server_list%.*}; server_get=${server_get%.*}; server_delete=${server_delete%.*}
-server_total=$((server_put + server_list + server_get + server_delete))
+server_put=${server_put:-0}; server_list=${server_list:-0}; server_list_recursive=${server_list_recursive:-0}; server_get=${server_get:-0}; server_delete=${server_delete:-0}
+server_put=${server_put%.*}; server_list=${server_list%.*}; server_list_recursive=${server_list_recursive%.*}; server_get=${server_get%.*}; server_delete=${server_delete%.*}
+# Combine list and list_recursive (both Class A operations)
+server_list_all=$((server_list + server_list_recursive))
+server_total=$((server_put + server_list_all + server_get + server_delete))
 
 total_put=$((agent_put + server_put))
-total_list=$((agent_list + server_list))
+total_list_all=$((agent_list_all + server_list_all))
 total_get=$((agent_get + server_get))
 total_delete=$((agent_delete + server_delete))
-grand_total=$((total_put + total_list + total_get + total_delete))
+grand_total=$((total_put + total_list_all + total_get + total_delete))
 
 printf "  %-12s | %10s | %10s | %10s | %14s | %10s\n" "Component" "Put (A)" "List (A)" "Get (B)" "Delete (free)" "Total"
 printf "  %-12s-|-%10s-|-%10s-|-%10s-|-%14s-|-%10s\n" "------------" "----------" "----------" "----------" "--------------" "----------"
-printf "  %-12s | %10s | %10s | %10s | %14s | %10s\n" "agent" "$(format_number $agent_put)" "$(format_number $agent_list)" "$(format_number $agent_get)" "$(format_number $agent_delete)" "$(format_number $agent_total)"
-printf "  %-12s | %10s | %10s | %10s | %14s | %10s\n" "server" "$(format_number $server_put)" "$(format_number $server_list)" "$(format_number $server_get)" "$(format_number $server_delete)" "$(format_number $server_total)"
+printf "  %-12s | %10s | %10s | %10s | %14s | %10s\n" "agent" "$(format_number $agent_put)" "$(format_number $agent_list_all)" "$(format_number $agent_get)" "$(format_number $agent_delete)" "$(format_number $agent_total)"
+printf "  %-12s | %10s | %10s | %10s | %14s | %10s\n" "server" "$(format_number $server_put)" "$(format_number $server_list_all)" "$(format_number $server_get)" "$(format_number $server_delete)" "$(format_number $server_total)"
 printf "  %-12s-|-%10s-|-%10s-|-%10s-|-%14s-|-%10s\n" "------------" "----------" "----------" "----------" "--------------" "----------"
-printf "  %-12s | %10s | %10s | %10s | %14s | %10s\n" "TOTAL" "$(format_number $total_put)" "$(format_number $total_list)" "$(format_number $total_get)" "$(format_number $total_delete)" "$(format_number $grand_total)"
+printf "  %-12s | %10s | %10s | %10s | %14s | %10s\n" "TOTAL" "$(format_number $total_put)" "$(format_number $total_list_all)" "$(format_number $total_get)" "$(format_number $total_delete)" "$(format_number $grand_total)"
 
 echo ""
 
@@ -150,7 +160,7 @@ echo ""
 echo "C) Cost Estimation with Per-Component Breakdown"
 echo "------------------------------------------------------------"
 
-agent_class_a_ops=$((agent_put + agent_list))
+agent_class_a_ops=$((agent_put + agent_list_all))
 agent_class_a_cost=$(calc_cost $agent_class_a_ops "$PRICE_CLASS_A")
 agent_class_b_cost=$(calc_cost $agent_get "$PRICE_CLASS_B")
 agent_hourly=$(echo "$agent_class_a_cost $agent_class_b_cost" | awk '{printf "%.4f", $1 + $2}')
@@ -158,28 +168,31 @@ agent_hourly=$(echo "$agent_class_a_cost $agent_class_b_cost" | awk '{printf "%.
 echo ""
 echo "  AGENT (per-node cost — scales linearly with node count)"
 printf "    Class A (put + list):  %s × \$%s/10k  = \$%s\n" "$(format_number $agent_class_a_ops)" "$PRICE_CLASS_A" "$agent_class_a_cost"
+printf "      of which list:       %s\n" "$(format_number $agent_list)"
+printf "      of which list_rec:   %s (consolidated poll)\n" "$(format_number $agent_list_recursive)"
+printf "      of which put:        %s\n" "$(format_number $agent_put)"
 printf "    Class B (get):         %s × \$%s/10k = \$%s\n" "$(format_number $agent_get)" "$PRICE_CLASS_B" "$agent_class_b_cost"
 printf "    Free (delete):         %s × \$0.00      = \$0.00\n" "$(format_number $agent_delete)"
 printf "    ── Agent hourly cost per node: \$%s\n" "$agent_hourly"
 
 echo ""
 
-server_class_a_ops=$((server_put + server_list))
+server_class_a_ops=$((server_put + server_list_all))
 server_class_a_cost=$(calc_cost $server_class_a_ops "$PRICE_CLASS_A")
 server_class_b_cost=$(calc_cost $server_get "$PRICE_CLASS_B")
 server_hourly=$(echo "$server_class_a_cost $server_class_b_cost" | awk '{printf "%.4f", $1 + $2}')
 
 # Server per-node ops: put + get + delete scale per-node; list is shared
-server_per_node_ops=$((server_put + server_get + server_delete))
 server_per_node_a_cost=$(calc_cost $server_put "$PRICE_CLASS_A")
 server_per_node_b_cost=$(calc_cost $server_get "$PRICE_CLASS_B")
 server_per_node_cost=$(echo "$server_per_node_a_cost $server_per_node_b_cost" | awk '{printf "%.4f", $1 + $2}')
 
-server_shared_cost=$(calc_cost $server_list "$PRICE_CLASS_A")
+server_shared_cost=$(calc_cost $server_list_all "$PRICE_CLASS_A")
 
 echo "  SERVER (shared cost — List scales sub-linearly; Get/Put/Delete scale per-node)"
 printf "    Class A (put + list):  %s × \$%s/10k  = \$%s\n" "$(format_number $server_class_a_ops)" "$PRICE_CLASS_A" "$server_class_a_cost"
-printf "      of which list:       %s (shared across nodes)\n" "$(format_number $server_list)"
+printf "      of which list:       %s\n" "$(format_number $server_list)"
+printf "      of which list_rec:   %s (per-node polling)\n" "$(format_number $server_list_recursive)"
 printf "      of which put:        %s (per-node)\n" "$(format_number $server_put)"
 printf "    Class B (get):         %s × \$%s/10k = \$%s\n" "$(format_number $server_get)" "$PRICE_CLASS_B" "$server_class_b_cost"
 printf "    Free (delete):         %s × \$0.00      = \$0.00\n" "$(format_number $server_delete)"
@@ -224,18 +237,20 @@ if [ -n "$METRICS_DIR" ] && ls "$METRICS_DIR"/agent-*.prom >/dev/null 2>&1; then
 
         a_put=$(extract_counter "$agent_snap" "put" "success"); a_put=${a_put:-0}; a_put=${a_put%.*}
         a_list=$(extract_counter "$agent_snap" "list" "success"); a_list=${a_list:-0}; a_list=${a_list%.*}
+        a_list_rec=$(extract_counter "$agent_snap" "list_recursive" "success"); a_list_rec=${a_list_rec:-0}; a_list_rec=${a_list_rec%.*}
         a_get=$(extract_counter "$agent_snap" "get" "success"); a_get=${a_get:-0}; a_get=${a_get%.*}
         a_del=$(extract_counter "$agent_snap" "delete" "success"); a_del=${a_del:-0}; a_del=${a_del%.*}
-        a_total=$((a_put + a_list + a_get + a_del))
+        a_total=$((a_put + a_list + a_list_rec + a_get + a_del))
 
         s_total=0
         if [ -f "$server_snap_file" ]; then
             server_snap=$(cat "$server_snap_file")
             s_put=$(extract_counter "$server_snap" "put" "success"); s_put=${s_put:-0}; s_put=${s_put%.*}
             s_list=$(extract_counter "$server_snap" "list" "success"); s_list=${s_list:-0}; s_list=${s_list%.*}
+            s_list_rec=$(extract_counter "$server_snap" "list_recursive" "success"); s_list_rec=${s_list_rec:-0}; s_list_rec=${s_list_rec%.*}
             s_get=$(extract_counter "$server_snap" "get" "success"); s_get=${s_get:-0}; s_get=${s_get%.*}
             s_del=$(extract_counter "$server_snap" "delete" "success"); s_del=${s_del:-0}; s_del=${s_del%.*}
-            s_total=$((s_put + s_list + s_get + s_del))
+            s_total=$((s_put + s_list + s_list_rec + s_get + s_del))
         fi
 
         if [ -n "$prev_ts" ] && [ -n "$prev_agent_total" ]; then
