@@ -250,7 +250,6 @@ func (p *BucketProxyServer) cleanupNodeFiles(nodeID string) {
 		"node-to-control/" + nodeID + "/",
 		"control-to-node/" + nodeID + "/",
 		"node-to-control-reverse/" + nodeID + "/",
-		"control-to-node-reverse/" + nodeID + "/",
 	}
 	for _, prefix := range prefixes {
 		keys, err := p.store.List(ctx, prefix)

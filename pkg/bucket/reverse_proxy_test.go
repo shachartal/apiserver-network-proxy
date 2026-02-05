@@ -47,10 +47,17 @@ func TestReverseProxy_EndToEnd(t *testing.T) {
 	t.Cleanup(handler.Stop)
 
 	// 4. Create agent-side ReverseProxy listening on a random port.
-	rp, err := NewReverseProxy(ctx, store, "node-1", "127.0.0.1:0", 50*time.Millisecond, 0)
+	rp, err := NewReverseProxy(ctx, store, "node-1", "127.0.0.1:0", 0)
 	if err != nil {
 		t.Fatalf("Failed to create ReverseProxy: %v", err)
 	}
+
+	// Start AgentPoller for consolidated polling (forward transport is nil since
+	// this test only exercises the reverse proxy path).
+	rpPoller := NewAgentPoller(ctx, store, "node-1", nil, rp.Transport(), 50*time.Millisecond)
+	go rpPoller.Run()
+	t.Cleanup(rpPoller.Stop)
+
 	go rp.Serve()
 	t.Cleanup(rp.Stop)
 
@@ -115,10 +122,15 @@ func TestReverseProxy_MultipleConnections(t *testing.T) {
 	go handler.Serve()
 	t.Cleanup(handler.Stop)
 
-	rp, err := NewReverseProxy(ctx, store, "node-2", "127.0.0.1:0", 50*time.Millisecond, 0)
+	rp, err := NewReverseProxy(ctx, store, "node-2", "127.0.0.1:0", 0)
 	if err != nil {
 		t.Fatalf("Failed to create ReverseProxy: %v", err)
 	}
+
+	rpPoller := NewAgentPoller(ctx, store, "node-2", nil, rp.Transport(), 50*time.Millisecond)
+	go rpPoller.Run()
+	t.Cleanup(rpPoller.Stop)
+
 	go rp.Serve()
 	t.Cleanup(rp.Stop)
 

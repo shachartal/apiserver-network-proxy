@@ -76,13 +76,14 @@ type BucketAgent struct {
 }
 
 // NewBucketAgent creates a new agent that communicates via the given Store.
-func NewBucketAgent(ctx context.Context, store Store, nodeID string, pollInterval, nagleDelay time.Duration) *BucketAgent {
+// The transport is send-only; receive is handled by an AgentPoller that pushes
+// to the transport's recvCh via a consolidated ListRecursive.
+func NewBucketAgent(ctx context.Context, store Store, nodeID string, nagleDelay time.Duration) *BucketAgent {
 	ctx, cancel := context.WithCancel(ctx)
-	// Agent sends to node-to-control/{nodeID}/, receives from control-to-node/{nodeID}/
-	transport := NewBucketTransport(ctx, store,
+	// Agent sends to node-to-control/{nodeID}/.
+	// Receive is handled externally by AgentPoller.
+	transport := newSendOnlyTransport(ctx, store,
 		"node-to-control/"+nodeID+"/",
-		"control-to-node/"+nodeID+"/",
-		pollInterval,
 		nagleDelay,
 	)
 	return &BucketAgent{
@@ -93,6 +94,12 @@ func NewBucketAgent(ctx context.Context, store Store, nodeID string, pollInterva
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+}
+
+// Transport returns the underlying BucketTransport, allowing an AgentPoller
+// to push received packets into the transport's receive channel.
+func (a *BucketAgent) Transport() *BucketTransport {
+	return a.transport
 }
 
 // Serve starts the main packet handling loop. Blocks until the context is

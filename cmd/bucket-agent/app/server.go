@@ -55,6 +55,7 @@ func NewBucketAgentCommand(a *BucketProxyAgent, o *options.BucketProxyAgentOptio
 type BucketProxyAgent struct {
 	agent        *bucket.BucketAgent
 	reverseProxy *bucket.ReverseProxy
+	poller       *bucket.AgentPoller
 	healthServer *http.Server
 	adminServer  *http.Server
 }
@@ -74,21 +75,27 @@ func (a *BucketProxyAgent) Run(o *options.BucketProxyAgentOptions, stopCh <-chan
 	}
 	store := bucket.NewMetricsStore(rawStore)
 
-	// Create and start the bucket agent.
-	a.agent = bucket.NewBucketAgent(ctx, store, o.NodeID, o.PollInterval, o.NagleDelay)
+	// Create the bucket agent (send-only transport; receive handled by AgentPoller).
+	a.agent = bucket.NewBucketAgent(ctx, store, o.NodeID, o.NagleDelay)
 
-	// Start reverse proxy if configured.
+	// Create reverse proxy if configured (also send-only transport).
+	var revTransport *bucket.BucketTransport
 	if o.ReverseProxyListen != "" {
-		rp, err := bucket.NewReverseProxy(ctx, store, o.NodeID, o.ReverseProxyListen, o.PollInterval, o.NagleDelay)
+		rp, err := bucket.NewReverseProxy(ctx, store, o.NodeID, o.ReverseProxyListen, o.NagleDelay)
 		if err != nil {
 			return fmt.Errorf("failed to create reverse proxy: %v", err)
 		}
 		a.reverseProxy = rp
+		revTransport = rp.Transport()
 		go func() {
 			klog.V(1).Infof("Reverse proxy listening on %s", o.ReverseProxyListen)
 			rp.Serve()
 		}()
 	}
+
+	// Create consolidated poller: one ListRecursive for both forward and reverse.
+	a.poller = bucket.NewAgentPoller(ctx, store, o.NodeID, a.agent.Transport(), revTransport, o.PollInterval)
+	go a.poller.Run()
 
 	// Start health and admin servers.
 	if err := a.runHealthServer(o); err != nil {
@@ -110,6 +117,7 @@ func (a *BucketProxyAgent) Run(o *options.BucketProxyAgentOptions, stopCh <-chan
 	select {
 	case <-stopCh:
 		klog.V(1).Infoln("Shutting down bucket proxy agent.")
+		a.poller.Stop()
 		if a.reverseProxy != nil {
 			a.reverseProxy.Stop()
 		}
