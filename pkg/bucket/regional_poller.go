@@ -52,6 +52,11 @@ type RegionalPoller struct {
 	// This allows HeartbeatMonitor to learn about nodes passively.
 	OnNodeDiscovered func(nodeID string)
 
+	// OnHeartbeatSeen is called when a heartbeat key is found during polling.
+	// This allows HeartbeatMonitor to read the heartbeat payload without
+	// doing its own per-node List calls.
+	OnHeartbeatSeen func(nodeID, key string)
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -187,8 +192,11 @@ func (r *RegionalPoller) pollOnce() bool {
 		// Track discovered nodes for OnNodeDiscovered callback.
 		discoveredNodes[nodeID] = true
 
-		// Skip heartbeat files — they're handled by HeartbeatMonitor.
+		// Pass heartbeat files to HeartbeatMonitor instead of discarding them.
 		if isHeartbeatFile(filename) {
+			if r.OnHeartbeatSeen != nil {
+				r.OnHeartbeatSeen(nodeID, key)
+			}
 			continue
 		}
 
@@ -363,17 +371,6 @@ func (r *RegionalPoller) downloadAndDispatch(refs []messageRef) {
 			expectedSeq++
 		}
 	}
-}
-
-// extractNodeIDFromPrefixedKey extracts the node ID from a key like "node-to-control/node-1/"
-func extractNodeIDFromPrefixedKey(prefix, key string) string {
-	rest := strings.TrimPrefix(key, prefix)
-	rest = strings.TrimSuffix(rest, "/")
-	// Should be just the node ID with no more slashes.
-	if strings.Contains(rest, "/") {
-		return ""
-	}
-	return rest
 }
 
 // adaptiveInterval computes the next poll interval based on activity.

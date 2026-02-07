@@ -43,11 +43,15 @@ type endpointConn struct {
 }
 
 func (e *endpointConn) send(data []byte) {
-	select {
-	case e.dataCh <- data:
-	default:
-		klog.V(2).InfoS("Data channel full, dropping data")
+	defer func() {
+		if r := recover(); r != nil {
+			klog.V(4).InfoS("send on closed data channel (connection already closed)")
+		}
+	}()
+	if len(e.dataCh) >= dataChanSize {
+		klog.V(2).InfoS("Data channel near-full, backpressure active", "queued", len(e.dataCh))
 	}
+	e.dataCh <- data
 }
 
 func (e *endpointConn) close() {

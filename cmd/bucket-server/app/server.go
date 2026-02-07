@@ -112,7 +112,11 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	// Start heartbeat monitor first — it will receive node discovery events from the poller.
 	p.hbMonitor = bucket.NewHeartbeatMonitor(ctx, p.store, 30*time.Second, bucket.DefaultHeartbeatTimeout)
 	p.hbMonitor.OnNodeDiscovered = func(nodeID string) {
-		p.registerNode(nodeID)
+		// Run asynchronously to avoid deadlock: the poller notification
+		// callback runs while the poller holds mu.RLock, and registerNode
+		// acquires both p.mu and poller.mu (via RegisterNode). If two
+		// pollers discover the same node concurrently, this would deadlock.
+		go p.registerNode(nodeID)
 	}
 	p.hbMonitor.OnNodeStale = func(nodeID string) {
 		p.unregisterNode(nodeID)
@@ -126,6 +130,7 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	p.poller.OnNodeDiscovered = func(nodeID string) {
 		p.hbMonitor.NotifyNodeSeen(nodeID)
 	}
+	p.poller.OnHeartbeatSeen = p.hbMonitor.UpdateHeartbeat
 	go p.poller.Run()
 
 	// Start regional poller for reverse tunnel (if enabled).

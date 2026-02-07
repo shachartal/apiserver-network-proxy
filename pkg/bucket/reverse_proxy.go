@@ -62,11 +62,15 @@ type reverseConn struct {
 }
 
 func (rc *reverseConn) send(data []byte) {
-	select {
-	case rc.dataCh <- data:
-	default:
-		klog.V(2).InfoS("Reverse proxy data channel full, dropping data")
+	defer func() {
+		if r := recover(); r != nil {
+			klog.V(4).InfoS("send on closed reverse proxy data channel (connection already closed)")
+		}
+	}()
+	if len(rc.dataCh) >= dataChanSize {
+		klog.V(2).InfoS("Reverse proxy data channel near-full, backpressure active", "queued", len(rc.dataCh))
 	}
+	rc.dataCh <- data
 }
 
 func (rc *reverseConn) close() {
