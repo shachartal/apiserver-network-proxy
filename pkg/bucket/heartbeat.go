@@ -137,16 +137,19 @@ func (h *HeartbeatPublisher) publish() {
 // It tracks the last seen heartbeat time for each node and reports
 // nodes that have gone stale.
 //
-// Node discovery is handled passively via NotifyNodeSeen(), which is
-// called by RegionalPoller when it discovers nodes through ListRecursive.
-// This eliminates the need for HeartbeatMonitor to do its own List calls.
+// Heartbeat updates are driven by RegionalPoller: when the poller sees a
+// heartbeat key during its ListRecursive scan, it calls UpdateHeartbeat
+// which reads the 8-byte timestamp payload via a single Get call. This
+// replaces the old per-node List+Get pattern, saving 2N API calls per
+// check cycle. The monitor's own tick loop only scans for stale nodes.
 type HeartbeatMonitor struct {
 	store        Store
 	pollInterval time.Duration
 	timeout      time.Duration
 
-	mu       sync.RWMutex
-	lastSeen map[string]time.Time // nodeID → last heartbeat time
+	mu        sync.RWMutex
+	lastSeen  map[string]time.Time   // nodeID → last heartbeat time
+	lastHBKey map[string]string      // nodeID → last heartbeat key seen (to avoid re-reads)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -166,6 +169,7 @@ func NewHeartbeatMonitor(ctx context.Context, store Store, pollInterval, timeout
 		pollInterval: pollInterval,
 		timeout:      timeout,
 		lastSeen:     make(map[string]time.Time),
+		lastHBKey:    make(map[string]string),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
@@ -233,7 +237,7 @@ func (m *HeartbeatMonitor) NotifyNodeSeen(nodeID string) {
 	m.mu.Lock()
 	_, known := m.lastSeen[nodeID]
 	if !known {
-		// Initialize with current time; checkNode will update with actual heartbeat timestamp.
+		// Initialize with current time; UpdateHeartbeat will update with actual heartbeat timestamp.
 		m.lastSeen[nodeID] = time.Now()
 	}
 	m.mu.Unlock()
@@ -246,22 +250,54 @@ func (m *HeartbeatMonitor) NotifyNodeSeen(nodeID string) {
 	}
 }
 
-func (m *HeartbeatMonitor) check() {
-	// Get the list of known nodes. RegionalPoller discovers new nodes and
-	// notifies us via NotifyNodeSeen, so we don't need to do discovery here.
+// UpdateHeartbeat is called by RegionalPoller when it sees a heartbeat key
+// during its ListRecursive scan. It reads the 8-byte timestamp payload via
+// a single Get call and updates the node's last-seen time. This replaces
+// the old per-node List+Get pattern.
+func (m *HeartbeatMonitor) UpdateHeartbeat(nodeID, key string) {
+	// Skip if we already processed this exact heartbeat key.
 	m.mu.RLock()
-	nodeIDs := make([]string, 0, len(m.lastSeen))
-	for id := range m.lastSeen {
-		nodeIDs = append(nodeIDs, id)
+	if m.lastHBKey[nodeID] == key {
+		m.mu.RUnlock()
+		return
 	}
 	m.mu.RUnlock()
 
-	// Check heartbeat for each known node.
-	for _, nodeID := range nodeIDs {
-		m.checkNode(nodeID)
+	data, err := m.store.Get(m.ctx, key)
+	if err != nil {
+		if m.ctx.Err() != nil {
+			return
+		}
+		klog.V(4).InfoS("HeartbeatMonitor failed to read heartbeat", "nodeID", nodeID, "key", key, "err", err)
+		return
+	}
+	if len(data) < 8 {
+		return
 	}
 
-	// Check for stale nodes.
+	tsMs := int64(binary.LittleEndian.Uint64(data))
+	ts := time.UnixMilli(tsMs)
+
+	m.mu.Lock()
+	_, known := m.lastSeen[nodeID]
+	m.lastSeen[nodeID] = ts
+	m.lastHBKey[nodeID] = key
+	m.mu.Unlock()
+
+	if !known {
+		klog.V(2).InfoS("New node discovered via heartbeat", "nodeID", nodeID)
+		if m.OnNodeDiscovered != nil {
+			m.OnNodeDiscovered(nodeID)
+		}
+	}
+
+	klog.V(5).InfoS("Heartbeat received", "nodeID", nodeID, "timestamp", ts)
+}
+
+// check scans for stale nodes in the in-memory map. Heartbeat updates
+// are now driven by RegionalPoller calling UpdateHeartbeat, so this
+// method no longer needs to do per-node List+Get calls.
+func (m *HeartbeatMonitor) check() {
 	m.mu.RLock()
 	now := time.Now()
 	var staleNodes []string
@@ -276,74 +312,12 @@ func (m *HeartbeatMonitor) check() {
 		klog.V(2).InfoS("Node heartbeat timed out", "nodeID", id)
 		m.mu.Lock()
 		delete(m.lastSeen, id)
+		delete(m.lastHBKey, id)
 		m.mu.Unlock()
 		if m.OnNodeStale != nil {
 			m.OnNodeStale(id)
 		}
 	}
-}
-
-func (m *HeartbeatMonitor) checkNode(nodeID string) {
-	prefix := fmt.Sprintf("%s%s/", heartbeatPrefix, nodeID)
-	keys, err := m.store.List(m.ctx, prefix)
-	if err != nil {
-		if m.ctx.Err() != nil {
-			return
-		}
-		klog.V(4).InfoS("HeartbeatMonitor node list error", "nodeID", nodeID, "err", err)
-		return
-	}
-
-	// Find heartbeat files and read the latest one.
-	for i := len(keys) - 1; i >= 0; i-- {
-		key := keys[i]
-		if !isHeartbeatKey(key) {
-			continue
-		}
-
-		data, err := m.store.Get(m.ctx, key)
-		if err != nil {
-			continue
-		}
-		if len(data) < 8 {
-			continue
-		}
-
-		tsMs := int64(binary.LittleEndian.Uint64(data))
-		ts := time.UnixMilli(tsMs)
-
-		m.mu.Lock()
-		_, known := m.lastSeen[nodeID]
-		m.lastSeen[nodeID] = ts
-		m.mu.Unlock()
-
-		if !known {
-			klog.V(2).InfoS("New node discovered via heartbeat", "nodeID", nodeID)
-			if m.OnNodeDiscovered != nil {
-				m.OnNodeDiscovered(nodeID)
-			}
-		}
-
-		klog.V(5).InfoS("Heartbeat received", "nodeID", nodeID, "timestamp", ts)
-		return
-	}
-}
-
-// extractNodeID gets the node ID from a key like "node-to-control/node-1/something".
-func extractNodeID(key string) string {
-	// Strip prefix.
-	rest := key
-	if len(rest) > len(heartbeatPrefix) {
-		rest = rest[len(heartbeatPrefix):]
-	}
-	// The node ID is the first path component.
-	for i, c := range rest {
-		if c == '/' {
-			return rest[:i]
-		}
-	}
-	// If no slash, the whole thing might be a node directory name.
-	return rest
 }
 
 // isHeartbeatKey checks if a key is a heartbeat file.

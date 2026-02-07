@@ -19,6 +19,7 @@ package bucket
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -28,34 +29,26 @@ func TestHeartbeatPublishAndMonitor(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start a publisher with a fast interval.
-	pub := NewHeartbeatPublisher(ctx, store, "node-1", 100*time.Millisecond)
-	go pub.Run()
-	defer pub.Stop()
+	// Write a heartbeat file directly with a fresh timestamp.
+	ts := time.Now().UnixMilli()
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint64(data, uint64(ts))
+	hbKey := fmt.Sprintf("node-to-control/node-1/heartbeat-%0*d.hb", seqWidth, 1)
+	if err := store.Put(ctx, hbKey, data); err != nil {
+		t.Fatalf("Failed to write heartbeat: %v", err)
+	}
 
-	// Start a monitor with a fast poll interval.
-	mon := NewHeartbeatMonitor(ctx, store, 100*time.Millisecond, 5*time.Minute)
-	go mon.Run()
+	// Create a monitor — heartbeat updates are driven by UpdateHeartbeat,
+	// not the monitor's own tick loop.
+	mon := NewHeartbeatMonitor(ctx, store, 30*time.Second, 5*time.Minute)
 	defer mon.Stop()
 
-	// Simulate RegionalPoller discovering the node via NotifyNodeSeen.
-	// In production, this is called by RegionalPoller.OnNodeDiscovered.
-	time.Sleep(150 * time.Millisecond) // Let publisher write at least one heartbeat
-	mon.NotifyNodeSeen("node-1")
+	// Simulate RegionalPoller discovering the heartbeat key and calling
+	// UpdateHeartbeat, which is the production flow.
+	mon.UpdateHeartbeat("node-1", hbKey)
 
-	// Wait for at least one heartbeat to be published and detected.
-	deadline := time.After(5 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("Timed out waiting for heartbeat detection")
-		default:
-		}
-
-		if mon.IsAlive("node-1") {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	if !mon.IsAlive("node-1") {
+		t.Fatal("Expected node-1 to be alive after UpdateHeartbeat")
 	}
 
 	last := mon.LastSeen("node-1")
@@ -77,6 +70,10 @@ func TestHeartbeatPublishAndMonitor(t *testing.T) {
 	if !found {
 		t.Errorf("node-1 not in AliveNodes: %v", alive)
 	}
+
+	// Verify that calling UpdateHeartbeat with the same key is a no-op
+	// (the dedup via lastHBKey should skip the Get call).
+	mon.UpdateHeartbeat("node-1", hbKey)
 }
 
 func TestHeartbeatStaleDetection(t *testing.T) {
@@ -84,12 +81,12 @@ func TestHeartbeatStaleDetection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Write a heartbeat file directly (simulating an agent that crashed
-	// without graceful shutdown, so its heartbeat file remains).
-	ts := time.Now().UnixMilli()
+	// Write a heartbeat file with a timestamp far in the past so it's already stale.
+	staleTs := time.Now().Add(-10 * time.Minute).UnixMilli()
 	data := make([]byte, 8)
-	binary.LittleEndian.PutUint64(data, uint64(ts))
-	if err := store.Put(ctx, "node-to-control/stale-node/heartbeat-0000000001.hb", data); err != nil {
+	binary.LittleEndian.PutUint64(data, uint64(staleTs))
+	hbKey := fmt.Sprintf("node-to-control/stale-node/heartbeat-%0*d.hb", seqWidth, 1)
+	if err := store.Put(ctx, hbKey, data); err != nil {
 		t.Fatalf("Failed to write heartbeat: %v", err)
 	}
 
@@ -105,10 +102,11 @@ func TestHeartbeatStaleDetection(t *testing.T) {
 	go mon.Run()
 	defer mon.Stop()
 
-	// Simulate RegionalPoller discovering the node via NotifyNodeSeen.
-	mon.NotifyNodeSeen("stale-node")
+	// Simulate RegionalPoller seeing the heartbeat and calling UpdateHeartbeat.
+	// This reads the stale timestamp from the file.
+	mon.UpdateHeartbeat("stale-node", hbKey)
 
-	// Wait for stale detection.
+	// Wait for stale detection (the monitor's tick loop checks for stale nodes).
 	select {
 	case nodeID := <-staleCh:
 		if nodeID != "stale-node" {

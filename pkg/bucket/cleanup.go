@@ -29,31 +29,27 @@ const (
 	DefaultCleanupInterval = 60 * time.Second
 )
 
-// CleanupWorker periodically scans bucket prefixes and deletes stale messages
-// that were not cleaned up by inline deletion (e.g., orphaned by crashes or
-// timing issues).
+// CleanupWorker periodically scans bucket prefixes and deletes ALL .pb files
+// it finds. It is intended for sweeping stale/dead paths (e.g., after a node
+// is unregistered) — not for active transport paths where inline deletion
+// handles message cleanup. Heartbeat files (.hb) are skipped.
 type CleanupWorker struct {
 	store    Store
 	prefixes []string // bucket prefixes to scan (e.g. "control-to-node/node-1/")
 	interval time.Duration
-	// maxAge is the maximum age of a message before it is deleted regardless
-	// of processing state. Messages older than this are considered stale.
-	maxAge time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
-// NewCleanupWorker creates a cleanup worker that scans the given prefixes.
-// maxAge controls how old a message must be before it is unconditionally deleted
-// (the PRD specifies 24 hours for stale messages).
-func NewCleanupWorker(ctx context.Context, store Store, prefixes []string, interval, maxAge time.Duration) *CleanupWorker {
+// NewCleanupWorker creates a cleanup worker that scans the given prefixes
+// and unconditionally deletes any .pb files found on each sweep cycle.
+func NewCleanupWorker(ctx context.Context, store Store, prefixes []string, interval time.Duration) *CleanupWorker {
 	ctx, cancel := context.WithCancel(ctx)
 	return &CleanupWorker{
 		store:    store,
 		prefixes: prefixes,
 		interval: interval,
-		maxAge:   maxAge,
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -61,7 +57,7 @@ func NewCleanupWorker(ctx context.Context, store Store, prefixes []string, inter
 
 // Run starts the cleanup loop. Blocks until the context is cancelled.
 func (c *CleanupWorker) Run() {
-	klog.V(2).InfoS("CleanupWorker started", "prefixes", c.prefixes, "interval", c.interval, "maxAge", c.maxAge)
+	klog.V(2).InfoS("CleanupWorker started", "prefixes", c.prefixes, "interval", c.interval)
 	defer klog.V(2).InfoS("CleanupWorker stopped")
 
 	ticker := time.NewTicker(c.interval)
