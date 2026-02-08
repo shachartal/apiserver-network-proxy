@@ -93,13 +93,28 @@ Defined in `konnectivity-client/proto/client/client.proto`. Packet types: `DIAL_
 ### Dev Environment (Bucket Transport)
 
 Scripts in `hack/bucket-dev/`:
-- `setup.sh` — Creates k3d cluster + multipass VM + GCS bucket
+- `setup.sh` — Creates k3d cluster + worker VM + GCS bucket
 - `redeploy-server.sh` — Rebuilds and redeploys bucket-proxy-server
 - `benchmark-costs.sh` — 10-minute cost estimation run
+- `teardown.sh` — Drains overlay nodes, destroys VM and k3d cluster
+
+The worker VM backend is controlled by `VM_BACKEND`:
+- `multipass` (default) — Local VM, requires `multipass` CLI and a GCS credentials file
+- `gcp` — GCE VM in a locked-down VPC, uses VM service account ADC for GCS (no credentials file on VM)
+
+GCP-specific variables (set in `setup.sh` defaults or env):
+- `GCP_PROJECT`, `GCP_ZONE`, `GCP_NETWORK`, `GCP_SUBNET`, `GCP_SERVICE_ACCOUNT`
+
+GCP networking infrastructure (`hack/terraform/demo-env/`):
+- Custom VPC with deny-all-egress firewall (zero internet access)
+- Private Service Connect endpoint for GCS (`*.googleapis.com` → PSC IP via private DNS)
+- IAP SSH for VM access without external IPs
+- Worker service account with `roles/storage.admin`
 
 Known quirks:
 - After `redeploy-server.sh`, kube-apiserver pod may not restart. Fix: `kubectl apply -f hack/bucket-dev/manifests/apiserver.yaml`
 - After server restart, also restart agent+kubelet on VM to reset sequence counters
+- Containerd CRI sandbox image pulls bypass the `_default/hosts.toml` mirror; cloud-init pre-pulls the pause image directly from the local registry to work around this
 
 ## Code Conventions
 

@@ -24,7 +24,10 @@
 # Environment variables:
 #   BENCHMARK_DURATION  — total benchmark duration in seconds (default: 600)
 #   SAMPLE_INTERVAL     — seconds between metric snapshots (default: 60)
-#   VM_NAME             — multipass VM name (default: bucket-agent-vm)
+#   VM_NAME             — VM name (default: bucket-agent-vm)
+#   VM_BACKEND          — "multipass" (default) or "gcp"
+#   GCP_PROJECT         — GCP project ID (required when VM_BACKEND=gcp)
+#   GCP_ZONE            — GCP zone (default: "us-east1-b")
 #   NAMESPACE           — kubernetes namespace (default: overlay-system)
 
 set -euo pipefail
@@ -34,6 +37,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCHMARK_DURATION="${BENCHMARK_DURATION:-600}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-60}"
 VM_NAME="${VM_NAME:-bucket-agent-vm}"
+VM_BACKEND="${VM_BACKEND:-multipass}"
+GCP_PROJECT="${GCP_PROJECT:-}"
+GCP_ZONE="${GCP_ZONE:-us-east1-b}"
 NAMESPACE="${NAMESPACE:-overlay-system}"
 AGENT_ADMIN_PORT="${AGENT_ADMIN_PORT:-8094}"
 SERVER_ADMIN_PORT="${SERVER_ADMIN_PORT:-8095}"
@@ -124,7 +130,15 @@ collect_metrics() {
 
         # Collect agent metrics.
         local agent_file="$OUTPUT_DIR/agent-${ts}.prom"
-        multipass exec "$VM_NAME" -- curl -s "http://127.0.0.1:${AGENT_ADMIN_PORT}/metrics" > "$agent_file" 2>/dev/null || true
+        if [ "$VM_BACKEND" = "gcp" ]; then
+            gcloud compute ssh "$VM_NAME" \
+                --project="$GCP_PROJECT" --zone="$GCP_ZONE" \
+                --tunnel-through-iap \
+                --command="curl -s http://127.0.0.1:${AGENT_ADMIN_PORT}/metrics" \
+                > "$agent_file" 2>/dev/null || true
+        else
+            multipass exec "$VM_NAME" -- curl -s "http://127.0.0.1:${AGENT_ADMIN_PORT}/metrics" > "$agent_file" 2>/dev/null || true
+        fi
 
         # Collect server metrics via port-forward.
         local server_file="$OUTPUT_DIR/server-${ts}.prom"

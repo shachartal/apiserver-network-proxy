@@ -1,12 +1,13 @@
 #cloud-config
-# Cloud-init for the bucket-agent Multipass VM.
+# Cloud-init for the bucket-agent GCP VM.
 #
 # Placeholders (substituted by setup.sh at render time):
-#   GCS credentials, kubelet kubeconfig, GCS bucket/prefix, node ID
+#   kubelet kubeconfig, GCS bucket/prefix, node ID
 #
-# The VM is air-gapped (no internet access, only GCS bucket access).
-# install-from-bucket.sh runs automatically via runcmd and uses curl + GCS
-# REST API to download distributables, install binaries, and start services.
+# Unlike cloud-init.yaml (multipass), this variant uses the VM's service
+# account for GCS access — no credentials file is injected.
+# The GCS Go client, OCI Distribution registry, and install-from-bucket.sh
+# all obtain tokens from the GCE metadata server automatically.
 
 package_update: false
 manage_etc_hosts: false
@@ -55,7 +56,7 @@ write_files:
         debug:
           addr: 127.0.0.1:5001
 
-  # OCI Distribution registry systemd unit
+  # OCI Distribution registry systemd unit (uses VM service account via ADC)
   - path: /etc/systemd/system/bucket-registry.service
     content: |
       [Unit]
@@ -64,19 +65,12 @@ write_files:
       Before=kubelet.service
 
       [Service]
-      Environment=GOOGLE_APPLICATION_CREDENTIALS=/etc/gcs/application_default_credentials.json
       ExecStart=/usr/local/bin/registry serve /etc/distribution/config.yml
       Restart=always
       RestartSec=5
 
       [Install]
       WantedBy=multi-user.target
-
-  # GCS credentials for bucket-proxy-agent (injected by setup.sh)
-  - path: /etc/gcs/application_default_credentials.json
-    permissions: '0600'
-    content: |
-      GCS_CREDENTIALS_PLACEHOLDER
 
   # kubelet kubeconfig (injected by setup.sh — contains private key, never stored in bucket)
   - path: /etc/kubernetes/kubelet.kubeconfig
@@ -122,7 +116,7 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 
-  # bucket-proxy-agent systemd unit
+  # bucket-proxy-agent systemd unit (uses VM service account via ADC — no credentials file)
   - path: /etc/systemd/system/bucket-proxy-agent.service
     content: |
       [Unit]
@@ -134,7 +128,6 @@ write_files:
         --store-type=gcs \
         --gcs-bucket=GCS_BUCKET_PLACEHOLDER \
         --gcs-prefix=GCS_PREFIX_PLACEHOLDER \
-        --gcs-credentials-file=/etc/gcs/application_default_credentials.json \
         --node-id=NODE_ID_PLACEHOLDER \
         --poll-interval=0 \
         --nagle-delay=50ms \
@@ -147,7 +140,7 @@ write_files:
       WantedBy=multi-user.target
 
   # Install script that pulls everything from GCS using curl + REST API.
-  # No gsutil or gcloud needed — works on air-gapped VMs with only curl.
+  # On GCP VMs, uses the metadata server for access tokens (no credentials file needed).
   - path: /usr/local/bin/install-from-bucket.sh
     permissions: '0755'
     content: |
@@ -156,7 +149,6 @@ write_files:
 
       GCS_BUCKET="GCS_BUCKET_PLACEHOLDER"
       GCS_PREFIX="GCS_PREFIX_PLACEHOLDER"
-      CREDS_FILE="/etc/gcs/application_default_credentials.json"
       LOCAL_BASE="/tmp/bucket-distributables"
 
       # ---- GCS REST API helpers using curl ----
@@ -166,16 +158,10 @@ write_files:
         python3 -c "import json,sys; print(json.load(sys.stdin)['$1'])"
       }
 
-      # Obtain an OAuth2 access token from the refresh token in the credentials file.
+      # Obtain an OAuth2 access token from the GCE metadata server.
       get_access_token() {
-        local client_id client_secret refresh_token
-        client_id=$(json_get client_id < "$CREDS_FILE")
-        client_secret=$(json_get client_secret < "$CREDS_FILE")
-        refresh_token=$(json_get refresh_token < "$CREDS_FILE")
-
-        curl -sf -X POST "https://oauth2.googleapis.com/token" \
-          -H "Content-Type: application/x-www-form-urlencoded" \
-          -d "client_id=${client_id}&client_secret=${client_secret}&refresh_token=${refresh_token}&grant_type=refresh_token" \
+        curl -sf -H "Metadata-Flavor: Google" \
+          "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
           | json_get access_token
       }
 
@@ -231,10 +217,10 @@ write_files:
 
       # ---- Main install logic ----
 
-      echo "==> Obtaining GCS access token..."
+      echo "==> Obtaining GCS access token from metadata server..."
       ACCESS_TOKEN=$(get_access_token)
       if [ -z "$ACCESS_TOKEN" ]; then
-        echo "ERROR: Failed to obtain access token"
+        echo "ERROR: Failed to obtain access token from metadata server"
         exit 1
       fi
       echo "==> Access token obtained."

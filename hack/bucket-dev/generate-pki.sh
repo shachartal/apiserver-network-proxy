@@ -37,10 +37,6 @@ set -euo pipefail
 PKI_DIR="${1:?Usage: $0 <output-dir>}"
 mkdir -p "$PKI_DIR"
 
-# The apiserver will be reachable from the VM via NodePort on the host.
-# We include common SANs; the caller can set APISERVER_EXTRA_SANS if needed.
-APISERVER_EXTRA_SANS="${APISERVER_EXTRA_SANS:-}"
-
 DAYS=3650
 RSA_BITS=2048
 
@@ -116,9 +112,6 @@ gen_ca
 # --- apiserver serving cert ---
 log "Generating apiserver serving cert"
 SANS="DNS:localhost,DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kube-apiserver,DNS:kube-apiserver.overlay-system.svc,IP:127.0.0.1,IP:10.96.0.1"
-if [ -n "$APISERVER_EXTRA_SANS" ]; then
-    SANS="${SANS},${APISERVER_EXTRA_SANS}"
-fi
 
 cat > "$PKI_DIR/apiserver-ext.cnf" <<EOF
 [v3_req]

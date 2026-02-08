@@ -17,18 +17,27 @@
 #
 # Architecture:
 #   - k3d cluster (underlay) running overlay control plane pods
-#   - Multipass VM running kubelet + bucket-proxy-agent
+#   - Worker VM running kubelet + bucket-proxy-agent (multipass or GCP)
 #   - GCS bucket for transport and distributable storage
 #
 # Prerequisites:
-#   - docker, k3d, multipass, kubectl, openssl
+#   - docker, k3d, kubectl, openssl
+#   - multipass (for VM_BACKEND=multipass) or gcloud (for VM_BACKEND=gcp)
 #   - Run 'make build-bucket-linux' first to build the linux binaries
 #   - Run './upload-distributables.sh' once to upload kubelet, containerd, etc. to GCS
 #
 # Environment variables:
+#   VM_BACKEND           — "multipass" (default) or "gcp"
 #   GCS_CREDENTIALS_FILE — path to GCS credentials JSON file (required)
 #   GCS_BUCKET           — GCS bucket name (required)
 #   GCS_PREFIX           — key prefix within the bucket (default: "bucket-dev/")
+#
+# GCP-specific environment variables (required when VM_BACKEND=gcp):
+#   GCP_PROJECT          — GCP project ID
+#   GCP_ZONE             — GCP zone (default: "us-east1-b")
+#   GCP_NETWORK          — VPC name (from terraform output)
+#   GCP_SUBNET           — Subnet self-link (from terraform output)
+#   GCP_SERVICE_ACCOUNT  — Worker node service account email (from terraform output)
 
 set -euo pipefail
 
@@ -40,6 +49,7 @@ NAMESPACE="overlay-system"
 BUCKET_DIR="/tmp/bucket-dev"
 PKI_DIR="/tmp/bucket-dev-pki"
 VM_NAME="bucket-agent-vm"
+VM_BACKEND="${VM_BACKEND:-multipass}"
 GCS_CREDENTIALS_FILE="${GCS_CREDENTIALS_FILE:-}"
 GCS_BUCKET="${GCS_BUCKET:-}"
 GCS_PREFIX="${GCS_PREFIX:-bucket-dev/}"
@@ -47,22 +57,43 @@ GCS_PREFIX="${GCS_PREFIX:-bucket-dev/}"
 # from previous runs interfering with the new agent.
 NODE_ID="bucket-agent-$(openssl rand -hex 4)"
 
+# GCP-specific variables (only used when VM_BACKEND=gcp).
+GCP_PROJECT="${GCP_PROJECT:-twistlock-dev-246815}"
+GCP_ZONE="${GCP_ZONE:-us-east1-b}"
+GCP_NETWORK="${GCP_NETWORK:-bucket-demo-vpc}"
+GCP_SUBNET="${GCP_SUBNET:-https://www.googleapis.com/compute/v1/projects/twistlock-dev-246815/regions/us-east1/subnetworks/bucket-demo-subnet}"
+GCP_SERVICE_ACCOUNT="${GCP_SERVICE_ACCOUNT:-bucket-demo-worker@twistlock-dev-246815.iam.gserviceaccount.com}"
+
 log() { echo ""; echo "===== $* ====="; echo ""; }
 
 # Detect target architecture.
-HOST_ARCH="$(uname -m)"
-case "$HOST_ARCH" in
-    x86_64)  GOARCH="amd64" ;;
-    aarch64|arm64) GOARCH="arm64" ;;
-    *) echo "ERROR: unsupported architecture $HOST_ARCH"; exit 1 ;;
-esac
+# GCP VMs are always amd64; multipass VMs match the host.
+if [ "$VM_BACKEND" = "gcp" ]; then
+    GOARCH="amd64"
+else
+    HOST_ARCH="$(uname -m)"
+    case "$HOST_ARCH" in
+        x86_64)  GOARCH="amd64" ;;
+        aarch64|arm64) GOARCH="arm64" ;;
+        *) echo "ERROR: unsupported architecture $HOST_ARCH"; exit 1 ;;
+    esac
+fi
 
 # ============================================================
 # 0. Preflight checks
 # ============================================================
 log "Preflight checks"
 
-for cmd in docker k3d multipass kubectl openssl crane; do
+echo "VM backend: $VM_BACKEND"
+
+COMMON_CMDS="docker k3d kubectl openssl crane"
+if [ "$VM_BACKEND" = "gcp" ]; then
+    REQUIRED_CMDS="$COMMON_CMDS gcloud"
+else
+    REQUIRED_CMDS="$COMMON_CMDS multipass"
+fi
+
+for cmd in $REQUIRED_CMDS; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: $cmd is required but not found in PATH"
         exit 1
@@ -83,6 +114,15 @@ fi
 if [ -z "$GCS_BUCKET" ]; then
     echo "ERROR: GCS_BUCKET must be set to a GCS bucket name"
     exit 1
+fi
+
+if [ "$VM_BACKEND" = "gcp" ]; then
+    for var in GCP_PROJECT GCP_NETWORK GCP_SUBNET GCP_SERVICE_ACCOUNT; do
+        if [ -z "${!var}" ]; then
+            echo "ERROR: $var must be set when VM_BACKEND=gcp"
+            exit 1
+        fi
+    done
 fi
 
 # ============================================================
@@ -114,13 +154,10 @@ echo "Distributables found in GCS."
 # ============================================================
 log "Generating PKI"
 
-# Detect the host IP that Multipass VMs can reach.
-# On macOS with Multipass, the host is typically reachable at 192.168.64.1.
-HOST_IP="${HOST_IP:-192.168.64.1}"
-
 # Generate control-plane PKI (CA + apiserver, admin, controller-manager, scheduler certs).
-APISERVER_EXTRA_SANS="IP:${HOST_IP}" \
-    "$SCRIPT_DIR/generate-pki.sh" "$PKI_DIR"
+# No extra SANs needed — the kubelet reaches the apiserver via the bucket
+# transport reverse proxy at 127.0.0.1:6443, not directly.
+"$SCRIPT_DIR/generate-pki.sh" "$PKI_DIR"
 
 # Generate per-node PKI (kubelet cert + kubeconfig).
 NODE_ID="$NODE_ID" \
@@ -249,59 +286,129 @@ for i in $(seq 1 10); do
 done
 
 # ============================================================
-# 9. Launch Multipass VM
+# 9. Launch worker VM
 # ============================================================
-log "Launching Multipass VM: $VM_NAME"
-
-# Delete existing VM if present.
-multipass delete "$VM_NAME" --purge 2>/dev/null || true
+log "Launching worker VM ($VM_BACKEND): $VM_NAME"
 
 echo "Node ID: $NODE_ID"
 
-# Render cloud-init template.
-# Substitutes all placeholders: GCS credentials, kubelet kubeconfig, bucket name, prefix.
-RENDERED_CLOUD_INIT=$(mktemp)
-awk -v creds_file="$GCS_CREDENTIALS_FILE" \
-    -v kubeconfig_file="$KUBELET_KUBECONFIG" \
-    -v gcs_bucket="$GCS_BUCKET" \
-    -v gcs_prefix="$GCS_PREFIX" \
-    -v node_id="$NODE_ID" '
-/^ *GCS_CREDENTIALS_PLACEHOLDER *$/ {
-    while ((getline line < creds_file) > 0) {
-        print "      " line
+# Helper: run a command on the worker VM.
+vm_exec() {
+    if [ "$VM_BACKEND" = "gcp" ]; then
+        gcloud compute ssh "$VM_NAME" \
+            --project="$GCP_PROJECT" --zone="$GCP_ZONE" \
+            --tunnel-through-iap --command="$*"
+    else
+        multipass exec "$VM_NAME" -- "$@"
+    fi
+}
+
+if [ "$VM_BACKEND" = "gcp" ]; then
+    # ---- GCP path ----
+
+    # Delete existing VM if present.
+    gcloud compute instances delete "$VM_NAME" \
+        --project="$GCP_PROJECT" --zone="$GCP_ZONE" --quiet 2>/dev/null || true
+
+    # Render cloud-init template (GCP variant: no credentials file).
+    RENDERED_CLOUD_INIT=$(mktemp)
+    awk -v kubeconfig_file="$KUBELET_KUBECONFIG" \
+        -v gcs_bucket="$GCS_BUCKET" \
+        -v gcs_prefix="$GCS_PREFIX" \
+        -v node_id="$NODE_ID" '
+    /^ *KUBELET_KUBECONFIG_PLACEHOLDER *$/ {
+        while ((getline line < kubeconfig_file) > 0) {
+            print "      " line
+        }
+        close(kubeconfig_file)
+        next
     }
-    close(creds_file)
-    next
-}
-/^ *KUBELET_KUBECONFIG_PLACEHOLDER *$/ {
-    while ((getline line < kubeconfig_file) > 0) {
-        print "      " line
+    {
+        gsub(/GCS_BUCKET_PLACEHOLDER/, gcs_bucket)
+        gsub(/GCS_PREFIX_PLACEHOLDER/, gcs_prefix)
+        gsub(/NODE_ID_PLACEHOLDER/, node_id)
+        print
     }
-    close(kubeconfig_file)
-    next
-}
-{
-    gsub(/GCS_BUCKET_PLACEHOLDER/, gcs_bucket)
-    gsub(/GCS_PREFIX_PLACEHOLDER/, gcs_prefix)
-    gsub(/NODE_ID_PLACEHOLDER/, node_id)
-    print
-}
-' "$SCRIPT_DIR/vm/cloud-init.yaml" > "$RENDERED_CLOUD_INIT"
+    ' "$SCRIPT_DIR/vm/cloud-init-gcp.yaml" > "$RENDERED_CLOUD_INIT"
 
-multipass launch 22.04 \
-    --name "$VM_NAME" \
-    --cpus 2 \
-    --memory 2G \
-    --disk 10G \
-    --cloud-init "$RENDERED_CLOUD_INIT"
-rm -f "$RENDERED_CLOUD_INIT"
+    gcloud compute instances create "$VM_NAME" \
+        --project="$GCP_PROJECT" \
+        --zone="$GCP_ZONE" \
+        --machine-type=n2-standard-2 \
+        --network-interface="network=$GCP_NETWORK,subnet=$GCP_SUBNET,no-address" \
+        --service-account="$GCP_SERVICE_ACCOUNT" \
+        --scopes=cloud-platform \
+        --image-family=ubuntu-2204-lts \
+        --image-project=ubuntu-os-cloud \
+        --boot-disk-size=10GB \
+        --metadata-from-file=user-data="$RENDERED_CLOUD_INIT"
+    rm -f "$RENDERED_CLOUD_INIT"
 
-echo "Waiting for cloud-init to complete (installs binaries and starts services)..."
-multipass exec "$VM_NAME" -- cloud-init status --wait || true
+    echo "Waiting for cloud-init to complete (installs binaries and starts services)..."
+    # GCE VMs take longer to become SSH-reachable via IAP.
+    for i in $(seq 1 12); do
+        if vm_exec "cloud-init status --wait" 2>/dev/null; then
+            break
+        fi
+        echo "  Waiting for SSH via IAP... ($i/12)"
+        sleep 10
+    done
 
-echo "Verifying services..."
-multipass exec "$VM_NAME" -- sudo systemctl status bucket-proxy-agent --no-pager || true
-multipass exec "$VM_NAME" -- sudo systemctl status kubelet --no-pager || true
+    echo "Verifying services..."
+    vm_exec "sudo systemctl status bucket-proxy-agent --no-pager" || true
+    vm_exec "sudo systemctl status kubelet --no-pager" || true
+
+else
+    # ---- Multipass path ----
+
+    # Delete existing VM if present.
+    multipass delete "$VM_NAME" --purge 2>/dev/null || true
+
+    # Render cloud-init template.
+    # Substitutes all placeholders: GCS credentials, kubelet kubeconfig, bucket name, prefix.
+    RENDERED_CLOUD_INIT=$(mktemp)
+    awk -v creds_file="$GCS_CREDENTIALS_FILE" \
+        -v kubeconfig_file="$KUBELET_KUBECONFIG" \
+        -v gcs_bucket="$GCS_BUCKET" \
+        -v gcs_prefix="$GCS_PREFIX" \
+        -v node_id="$NODE_ID" '
+    /^ *GCS_CREDENTIALS_PLACEHOLDER *$/ {
+        while ((getline line < creds_file) > 0) {
+            print "      " line
+        }
+        close(creds_file)
+        next
+    }
+    /^ *KUBELET_KUBECONFIG_PLACEHOLDER *$/ {
+        while ((getline line < kubeconfig_file) > 0) {
+            print "      " line
+        }
+        close(kubeconfig_file)
+        next
+    }
+    {
+        gsub(/GCS_BUCKET_PLACEHOLDER/, gcs_bucket)
+        gsub(/GCS_PREFIX_PLACEHOLDER/, gcs_prefix)
+        gsub(/NODE_ID_PLACEHOLDER/, node_id)
+        print
+    }
+    ' "$SCRIPT_DIR/vm/cloud-init.yaml" > "$RENDERED_CLOUD_INIT"
+
+    multipass launch 22.04 \
+        --name "$VM_NAME" \
+        --cpus 2 \
+        --memory 2G \
+        --disk 10G \
+        --cloud-init "$RENDERED_CLOUD_INIT"
+    rm -f "$RENDERED_CLOUD_INIT"
+
+    echo "Waiting for cloud-init to complete (installs binaries and starts services)..."
+    multipass exec "$VM_NAME" -- cloud-init status --wait || true
+
+    echo "Verifying services..."
+    multipass exec "$VM_NAME" -- sudo systemctl status bucket-proxy-agent --no-pager || true
+    multipass exec "$VM_NAME" -- sudo systemctl status kubelet --no-pager || true
+fi
 
 # ============================================================
 # 10. Wait for node registration
@@ -328,6 +435,7 @@ echo "Overlay namespace: $NAMESPACE"
 echo "GCS bucket:        gs://${GCS_BUCKET}/${GCS_PREFIX}"
 echo "PKI directory:     $PKI_DIR"
 echo "VM name:           $VM_NAME"
+echo "VM backend:        $VM_BACKEND"
 echo "Node ID:           $NODE_ID"
 echo "Architecture:      $GOARCH"
 echo ""
@@ -342,23 +450,35 @@ echo ""
 echo "# Check bucket-proxy-server logs:"
 echo "  kubectl -n $NAMESPACE logs kube-apiserver -c bucket-proxy-server -f"
 echo ""
-echo "# Check bucket-proxy-agent logs in VM:"
-echo "  multipass exec $VM_NAME -- sudo journalctl -u bucket-proxy-agent -f"
-echo ""
-echo "# Check kubelet logs in VM:"
-echo "  multipass exec $VM_NAME -- sudo journalctl -u kubelet -f"
+if [ "$VM_BACKEND" = "gcp" ]; then
+    SSH_CMD="gcloud compute ssh $VM_NAME --project=$GCP_PROJECT --zone=$GCP_ZONE --tunnel-through-iap"
+    echo "# Check bucket-proxy-agent logs in VM:"
+    echo "  $SSH_CMD --command='sudo journalctl -u bucket-proxy-agent -f'"
+    echo ""
+    echo "# Check kubelet logs in VM:"
+    echo "  $SSH_CMD --command='sudo journalctl -u kubelet -f'"
+    echo ""
+    echo "# SSH into VM:"
+    echo "  $SSH_CMD"
+else
+    echo "# Check bucket-proxy-agent logs in VM:"
+    echo "  multipass exec $VM_NAME -- sudo journalctl -u bucket-proxy-agent -f"
+    echo ""
+    echo "# Check kubelet logs in VM:"
+    echo "  multipass exec $VM_NAME -- sudo journalctl -u kubelet -f"
+    echo ""
+    echo "# SSH into VM:"
+    echo "  multipass shell $VM_NAME"
+fi
 echo ""
 echo "# Check GCS bucket contents:"
 echo "  gsutil ls gs://${GCS_BUCKET}/${GCS_PREFIX}"
-echo ""
-echo "# SSH into VM:"
-echo "  multipass shell $VM_NAME"
 echo ""
 echo "# Redeploy bucket-proxy-server (after code changes):"
 echo "  $SCRIPT_DIR/redeploy-server.sh"
 echo ""
 echo "# Tear down cluster and VM (preserves GCS distributables):"
-echo "  $SCRIPT_DIR/teardown.sh"
+echo "  VM_BACKEND=$VM_BACKEND $SCRIPT_DIR/teardown.sh"
 echo ""
 echo "# Upload distributables to GCS (run once or when deps change):"
 echo "  $SCRIPT_DIR/upload-distributables.sh"
