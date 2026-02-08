@@ -257,7 +257,7 @@ func (p *BucketProxyServer) cleanupNodeFiles(nodeID string) {
 		"node-to-control-reverse/" + nodeID + "/",
 	}
 	for _, prefix := range prefixes {
-		keys, err := p.store.List(ctx, prefix)
+		keys, err := p.store.ListRecursive(ctx, prefix)
 		if err != nil {
 			klog.V(4).InfoS("Failed to list keys for stale node cleanup", "prefix", prefix, "err", err)
 			continue
