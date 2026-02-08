@@ -200,6 +200,11 @@ func (r *RegionalPoller) pollOnce() bool {
 			continue
 		}
 
+		// Skip the registration marker file — it's not a data message.
+		if filename == registrationFile {
+			continue
+		}
+
 		// Skip if we don't have a handler for this node yet.
 		h, ok := r.handlers[nodeID]
 		if !ok {

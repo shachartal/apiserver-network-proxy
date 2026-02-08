@@ -134,13 +134,12 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	go p.poller.Run()
 
 	// Start regional poller for reverse tunnel (if enabled).
+	// The reverse poller does NOT trigger node registration — only heartbeats
+	// (via the forward poller) can register nodes. This prevents leftover
+	// reverse-tunnel data from re-registering a cleaned-up node.
 	if p.reverseProxyTarget != "" {
 		p.reversePoller = bucket.NewRegionalPoller(ctx, p.store, "node-to-control-reverse/")
 		p.reversePoller.SetWorkerCount(o.WorkerCount)
-		// Reverse poller also discovers nodes; share the notification.
-		p.reversePoller.OnNodeDiscovered = func(nodeID string) {
-			p.hbMonitor.NotifyNodeSeen(nodeID)
-		}
 		go p.reversePoller.Run()
 		klog.V(1).Infof("Reverse proxy enabled, target: %s", p.reverseProxyTarget)
 	}
@@ -198,6 +197,16 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 }
 
 func (p *BucketProxyServer) registerNode(nodeID string) {
+	// Check for registration file before proceeding. The agent writes this
+	// marker at startup; without it, leftover data cannot trigger registration.
+	regKey := "node-to-control/" + nodeID + "/register"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := p.store.Get(ctx, regKey); err != nil {
+		klog.V(4).InfoS("No registration file for node, skipping", "nodeID", nodeID)
+		return
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
