@@ -18,7 +18,6 @@ package bucket
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -45,6 +44,7 @@ type HeartbeatPublisher struct {
 	nodeID   string
 	interval time.Duration
 	seq      atomic.Uint64
+	prevKey  string // last published heartbeat key, for deletion
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -87,18 +87,16 @@ func (h *HeartbeatPublisher) Run() {
 // cleanup deletes the current heartbeat file on shutdown so it doesn't
 // remain in the bucket after the agent exits.
 func (h *HeartbeatPublisher) cleanup() {
-	seq := h.seq.Load()
-	if seq == 0 {
+	if h.prevKey == "" {
 		return
 	}
-	key := fmt.Sprintf("%s%s/heartbeat-%0*d%s", heartbeatPrefix, h.nodeID, seqWidth, seq, heartbeatSuffix)
 	// Use a fresh context since h.ctx is already cancelled.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := h.store.Delete(ctx, key); err != nil {
-		klog.V(2).InfoS("Failed to delete heartbeat on shutdown", "nodeID", h.nodeID, "key", key, "err", err)
+	if err := h.store.Delete(ctx, h.prevKey); err != nil {
+		klog.V(2).InfoS("Failed to delete heartbeat on shutdown", "nodeID", h.nodeID, "key", h.prevKey, "err", err)
 	} else {
-		klog.V(2).InfoS("Deleted heartbeat on shutdown", "nodeID", h.nodeID, "key", key)
+		klog.V(2).InfoS("Deleted heartbeat on shutdown", "nodeID", h.nodeID, "key", h.prevKey)
 	}
 }
 
@@ -109,14 +107,11 @@ func (h *HeartbeatPublisher) Stop() {
 
 func (h *HeartbeatPublisher) publish() {
 	seq := h.seq.Add(1)
-	key := fmt.Sprintf("%s%s/heartbeat-%0*d%s", heartbeatPrefix, h.nodeID, seqWidth, seq, heartbeatSuffix)
+	tsMs := time.Now().UnixMilli()
+	key := fmt.Sprintf("%s%s/heartbeat-%0*d-%d%s", heartbeatPrefix, h.nodeID, seqWidth, seq, tsMs, heartbeatSuffix)
 
-	// Heartbeat payload is the current timestamp in milliseconds (little-endian).
-	ts := time.Now().UnixMilli()
-	data := make([]byte, 8)
-	binary.LittleEndian.PutUint64(data, uint64(ts))
-
-	if err := h.store.Put(h.ctx, key, data); err != nil {
+	// Timestamp is encoded in the key; payload is empty.
+	if err := h.store.Put(h.ctx, key, nil); err != nil {
 		if h.ctx.Err() != nil {
 			return
 		}
@@ -125,10 +120,10 @@ func (h *HeartbeatPublisher) publish() {
 	}
 
 	// Clean up the previous heartbeat file to avoid accumulation.
-	if seq > 1 {
-		prevKey := fmt.Sprintf("%s%s/heartbeat-%0*d%s", heartbeatPrefix, h.nodeID, seqWidth, seq-1, heartbeatSuffix)
-		_ = h.store.Delete(h.ctx, prevKey)
+	if h.prevKey != "" {
+		_ = h.store.Delete(h.ctx, h.prevKey)
 	}
+	h.prevKey = key
 
 	klog.V(5).InfoS("Heartbeat published", "nodeID", h.nodeID, "seq", seq)
 }
@@ -139,17 +134,16 @@ func (h *HeartbeatPublisher) publish() {
 //
 // Heartbeat updates are driven by RegionalPoller: when the poller sees a
 // heartbeat key during its ListRecursive scan, it calls UpdateHeartbeat
-// which reads the 8-byte timestamp payload via a single Get call. This
-// replaces the old per-node List+Get pattern, saving 2N API calls per
-// check cycle. The monitor's own tick loop only scans for stale nodes.
+// which parses the timestamp embedded in the key filename. This avoids
+// any Get calls, saving one Class B GCS operation per node per poll cycle.
+// The monitor's own tick loop only scans for stale nodes.
 type HeartbeatMonitor struct {
-	store        Store
 	pollInterval time.Duration
 	timeout      time.Duration
 
 	mu        sync.RWMutex
 	lastSeen  map[string]time.Time   // nodeID → last heartbeat time
-	lastHBKey map[string]string      // nodeID → last heartbeat key seen (to avoid re-reads)
+	lastHBKey map[string]string      // nodeID → last heartbeat key seen (to avoid re-parses)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -162,10 +156,9 @@ type HeartbeatMonitor struct {
 }
 
 // NewHeartbeatMonitor creates a monitor that watches the bucket for agent heartbeats.
-func NewHeartbeatMonitor(ctx context.Context, store Store, pollInterval, timeout time.Duration) *HeartbeatMonitor {
+func NewHeartbeatMonitor(ctx context.Context, pollInterval, timeout time.Duration) *HeartbeatMonitor {
 	ctx, cancel := context.WithCancel(ctx)
 	return &HeartbeatMonitor{
-		store:        store,
 		pollInterval: pollInterval,
 		timeout:      timeout,
 		lastSeen:     make(map[string]time.Time),
@@ -251,9 +244,9 @@ func (m *HeartbeatMonitor) NotifyNodeSeen(nodeID string) {
 }
 
 // UpdateHeartbeat is called by RegionalPoller when it sees a heartbeat key
-// during its ListRecursive scan. It reads the 8-byte timestamp payload via
-// a single Get call and updates the node's last-seen time. This replaces
-// the old per-node List+Get pattern.
+// during its ListRecursive scan. It parses the timestamp embedded in the
+// key filename (heartbeat-{seq}-{tsMs}.hb) and updates the node's last-seen
+// time without any Get calls.
 func (m *HeartbeatMonitor) UpdateHeartbeat(nodeID, key string) {
 	// Skip if we already processed this exact heartbeat key.
 	m.mu.RLock()
@@ -263,20 +256,11 @@ func (m *HeartbeatMonitor) UpdateHeartbeat(nodeID, key string) {
 	}
 	m.mu.RUnlock()
 
-	data, err := m.store.Get(m.ctx, key)
+	ts, err := parseTimestampFromHBKey(key)
 	if err != nil {
-		if m.ctx.Err() != nil {
-			return
-		}
-		klog.V(4).InfoS("HeartbeatMonitor failed to read heartbeat", "nodeID", nodeID, "key", key, "err", err)
+		klog.V(4).InfoS("HeartbeatMonitor failed to parse heartbeat key", "nodeID", nodeID, "key", key, "err", err)
 		return
 	}
-	if len(data) < 8 {
-		return
-	}
-
-	tsMs := int64(binary.LittleEndian.Uint64(data))
-	ts := time.UnixMilli(tsMs)
 
 	m.mu.Lock()
 	_, known := m.lastSeen[nodeID]
@@ -318,6 +302,47 @@ func (m *HeartbeatMonitor) check() {
 			m.OnNodeStale(id)
 		}
 	}
+}
+
+// parseTimestampFromHBKey extracts the millisecond timestamp from a heartbeat
+// key of the form "…/heartbeat-{seq}-{tsMs}.hb".
+func parseTimestampFromHBKey(key string) (time.Time, error) {
+	// Find the filename after the last '/'.
+	name := key
+	if i := len(key) - 1; i >= 0 {
+		for ; i >= 0; i-- {
+			if key[i] == '/' {
+				name = key[i+1:]
+				break
+			}
+		}
+	}
+	// Strip the ".hb" suffix.
+	if len(name) < len(heartbeatSuffix) || name[len(name)-len(heartbeatSuffix):] != heartbeatSuffix {
+		return time.Time{}, fmt.Errorf("key %q missing %s suffix", key, heartbeatSuffix)
+	}
+	name = name[:len(name)-len(heartbeatSuffix)]
+	// name is now "heartbeat-{seq}-{tsMs}"
+	// Find the last '-' to extract the timestamp portion.
+	lastDash := -1
+	for i := len(name) - 1; i >= 0; i-- {
+		if name[i] == '-' {
+			lastDash = i
+			break
+		}
+	}
+	if lastDash < 0 {
+		return time.Time{}, fmt.Errorf("key %q has no timestamp field", key)
+	}
+	tsStr := name[lastDash+1:]
+	var tsMs int64
+	for _, c := range tsStr {
+		if c < '0' || c > '9' {
+			return time.Time{}, fmt.Errorf("key %q has non-numeric timestamp %q", key, tsStr)
+		}
+		tsMs = tsMs*10 + int64(c-'0')
+	}
+	return time.UnixMilli(tsMs), nil
 }
 
 // isHeartbeatKey checks if a key is a heartbeat file.

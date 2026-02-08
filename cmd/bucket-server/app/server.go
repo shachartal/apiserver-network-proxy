@@ -110,7 +110,7 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	}
 
 	// Start heartbeat monitor first — it will receive node discovery events from the poller.
-	p.hbMonitor = bucket.NewHeartbeatMonitor(ctx, p.store, 30*time.Second, bucket.DefaultHeartbeatTimeout)
+	p.hbMonitor = bucket.NewHeartbeatMonitor(ctx, 30*time.Second, bucket.DefaultHeartbeatTimeout)
 	p.hbMonitor.OnNodeDiscovered = func(nodeID string) {
 		// Run asynchronously to avoid deadlock: the poller notification
 		// callback runs while the poller holds mu.RLock, and registerNode
