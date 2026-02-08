@@ -19,6 +19,7 @@ package bucket
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -101,5 +102,64 @@ func TestHeartbeatStaleDetection(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Timed out waiting for stale node detection")
+	}
+}
+
+func TestNotifyNodeSeenDoesNotTriggerDiscovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mon := NewHeartbeatMonitor(ctx, 30*time.Second, 5*time.Minute)
+	defer mon.Stop()
+
+	discovered := false
+	mon.OnNodeDiscovered = func(nodeID string) {
+		discovered = true
+	}
+
+	// NotifyNodeSeen should track the node but NOT call OnNodeDiscovered.
+	mon.NotifyNodeSeen("ghost-node")
+
+	if discovered {
+		t.Fatal("NotifyNodeSeen should not trigger OnNodeDiscovered")
+	}
+
+	// The node should still be tracked internally.
+	if !mon.IsAlive("ghost-node") {
+		t.Fatal("Expected ghost-node to be tracked after NotifyNodeSeen")
+	}
+}
+
+func TestPublisherWritesAndCleansUpRegistrationFile(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFSStore(dir)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	pub := NewHeartbeatPublisher(ctx, store, "test-node", 50*time.Millisecond)
+
+	// Run in background — it will write the registration file immediately.
+	done := make(chan struct{})
+	go func() {
+		pub.Run()
+		close(done)
+	}()
+
+	// Give it time to start and write the registration file + first heartbeat.
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify registration file exists.
+	regKey := heartbeatPrefix + "test-node/" + registrationFile
+	if _, err := store.Get(ctx, regKey); err != nil {
+		t.Fatalf("Registration file should exist: %v", err)
+	}
+
+	// Stop the publisher — cleanup should delete the registration file.
+	cancel()
+	<-done
+
+	// Verify registration file is deleted.
+	regPath := filepath.Join(dir, "node-to-control", "test-node", registrationFile)
+	if _, err := store.Get(context.Background(), regKey); err == nil {
+		t.Fatalf("Registration file should be deleted after cleanup, but still exists at %s", regPath)
 	}
 }

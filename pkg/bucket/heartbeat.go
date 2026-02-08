@@ -62,11 +62,22 @@ func NewHeartbeatPublisher(ctx context.Context, store Store, nodeID string, inte
 	}
 }
 
+// registrationFile is the marker filename that agents write at startup.
+// The server only registers a node when this file exists.
+const registrationFile = "register"
+
 // Run starts publishing heartbeats. Blocks until the context is cancelled.
 func (h *HeartbeatPublisher) Run() {
 	klog.V(2).InfoS("HeartbeatPublisher started", "nodeID", h.nodeID, "interval", h.interval)
 	defer klog.V(2).InfoS("HeartbeatPublisher stopped", "nodeID", h.nodeID)
 	defer h.cleanup()
+
+	// Write registration marker before the first heartbeat so the server
+	// knows this is an actively-started agent, not leftover data.
+	regKey := heartbeatPrefix + h.nodeID + "/" + registrationFile
+	if err := h.store.Put(h.ctx, regKey, nil); err != nil {
+		klog.ErrorS(err, "Failed to write registration file", "nodeID", h.nodeID)
+	}
 
 	// Publish immediately on start.
 	h.publish()
@@ -84,15 +95,25 @@ func (h *HeartbeatPublisher) Run() {
 	}
 }
 
-// cleanup deletes the current heartbeat file on shutdown so it doesn't
-// remain in the bucket after the agent exits.
+// cleanup deletes the current heartbeat file and registration marker on
+// shutdown so they don't remain in the bucket after the agent exits.
 func (h *HeartbeatPublisher) cleanup() {
-	if h.prevKey == "" {
-		return
-	}
 	// Use a fresh context since h.ctx is already cancelled.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	// Delete registration marker.
+	regKey := heartbeatPrefix + h.nodeID + "/" + registrationFile
+	if err := h.store.Delete(ctx, regKey); err != nil {
+		klog.V(2).InfoS("Failed to delete registration file on shutdown", "nodeID", h.nodeID, "err", err)
+	} else {
+		klog.V(2).InfoS("Deleted registration file on shutdown", "nodeID", h.nodeID)
+	}
+
+	// Delete last heartbeat file.
+	if h.prevKey == "" {
+		return
+	}
 	if err := h.store.Delete(ctx, h.prevKey); err != nil {
 		klog.V(2).InfoS("Failed to delete heartbeat on shutdown", "nodeID", h.nodeID, "key", h.prevKey, "err", err)
 	} else {
@@ -224,8 +245,10 @@ func (m *HeartbeatMonitor) AliveNodes() []string {
 }
 
 // NotifyNodeSeen is called by RegionalPoller when it discovers a node via
-// ListRecursive. This allows HeartbeatMonitor to track nodes passively
-// without doing its own List calls for node discovery.
+// ListRecursive (e.g., leftover data files). It tracks the node for internal
+// bookkeeping but does NOT trigger OnNodeDiscovered — only UpdateHeartbeat
+// (which requires a recent heartbeat from an active agent) can do that.
+// This prevents stale leftover files from re-registering a cleaned-up node.
 func (m *HeartbeatMonitor) NotifyNodeSeen(nodeID string) {
 	m.mu.Lock()
 	_, known := m.lastSeen[nodeID]
@@ -236,10 +259,7 @@ func (m *HeartbeatMonitor) NotifyNodeSeen(nodeID string) {
 	m.mu.Unlock()
 
 	if !known {
-		klog.V(2).InfoS("New node discovered via RegionalPoller", "nodeID", nodeID)
-		if m.OnNodeDiscovered != nil {
-			m.OnNodeDiscovered(nodeID)
-		}
+		klog.V(4).InfoS("Node seen via RegionalPoller (not registering)", "nodeID", nodeID)
 	}
 }
 
