@@ -1,0 +1,356 @@
+#cloud-config
+# Cloud-init for the bucket-agent GCP VM.
+#
+# Placeholders (substituted by setup.sh at render time):
+#   kubelet kubeconfig, GCS bucket/prefix, node ID
+#
+# Unlike cloud-init.yaml (multipass), this variant uses the VM's service
+# account for GCS access — no credentials file is injected.
+# The GCS Go client, OCI Distribution registry, and install-from-bucket.sh
+# all obtain tokens from the GCE metadata server automatically.
+
+package_update: false
+manage_etc_hosts: false
+
+runcmd:
+  - mkdir -p /etc/kubernetes/pki
+  - echo "127.0.0.1 NODE_ID_PLACEHOLDER" >> /etc/hosts
+  - /usr/local/bin/install-from-bucket.sh
+
+write_files:
+  # containerd config
+  - path: /etc/containerd/config.toml
+    content: |
+      version = 2
+      [plugins."io.containerd.grpc.v1.cri"]
+        sandbox_image = "registry.k8s.io/pause:3.9"
+        [plugins."io.containerd.grpc.v1.cri".registry]
+          config_path = "/etc/containerd/certs.d"
+        [plugins."io.containerd.grpc.v1.cri".containerd]
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+            runtime_type = "io.containerd.runc.v2"
+            [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+              SystemdCgroup = true
+
+  # Containerd mirror: route all image pulls through local registry first
+  - path: /etc/containerd/certs.d/_default/hosts.toml
+    content: |
+      [host."http://127.0.0.1:5000"]
+        capabilities = ["pull", "resolve"]
+
+  # OCI Distribution registry config (read-only, GCS-backed)
+  - path: /etc/distribution/config.yml
+    content: |
+      version: 0.1
+      storage:
+        gcs:
+          bucket: GCS_BUCKET_PLACEHOLDER
+          rootdirectory: GCS_PREFIX_PLACEHOLDERimages
+        maintenance:
+          readonly:
+            enabled: true
+        redirect:
+          disable: true
+      http:
+        addr: 127.0.0.1:5000
+        debug:
+          addr: 127.0.0.1:5001
+
+  # OCI Distribution registry systemd unit (uses VM service account via ADC)
+  - path: /etc/systemd/system/bucket-registry.service
+    content: |
+      [Unit]
+      Description=OCI Distribution Registry
+      After=network.target
+      Before=kubelet.service
+
+      [Service]
+      ExecStart=/usr/local/bin/registry serve /etc/distribution/config.yml
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # kubelet kubeconfig (injected by setup.sh — contains private key, never stored in bucket)
+  - path: /etc/kubernetes/kubelet.kubeconfig
+    permissions: '0600'
+    content: |
+      KUBELET_KUBECONFIG_PLACEHOLDER
+
+  # kubelet config
+  - path: /var/lib/kubelet/config.yaml
+    content: |
+      apiVersion: kubelet.config.k8s.io/v1beta1
+      kind: KubeletConfiguration
+      authentication:
+        x509:
+          clientCAFile: /etc/kubernetes/pki/ca.crt
+        anonymous:
+          enabled: false
+      authorization:
+        mode: Webhook
+      cgroupDriver: systemd
+      containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
+      resolvConf: /run/systemd/resolve/resolv.conf
+      failSwapOn: false
+
+  # kubelet systemd unit
+  - path: /etc/systemd/system/kubelet.service
+    content: |
+      [Unit]
+      Description=kubelet
+      After=containerd.service bucket-registry.service
+      Requires=containerd.service
+      Wants=bucket-registry.service
+
+      [Service]
+      ExecStart=/usr/local/bin/kubelet \
+        --kubeconfig=/etc/kubernetes/kubelet.kubeconfig \
+        --config=/var/lib/kubelet/config.yaml \
+        --hostname-override=NODE_ID_PLACEHOLDER \
+        --v=2
+      Restart=always
+      RestartSec=10
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # bucket-proxy-agent systemd unit (uses VM service account via ADC — no credentials file)
+  - path: /etc/systemd/system/bucket-proxy-agent.service
+    content: |
+      [Unit]
+      Description=Bucket Proxy Agent
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/local/bin/bucket-proxy-agent \
+        --store-type=gcs \
+        --gcs-bucket=GCS_BUCKET_PLACEHOLDER \
+        --gcs-prefix=GCS_PREFIX_PLACEHOLDER \
+        --node-id=NODE_ID_PLACEHOLDER \
+        --poll-interval=0 \
+        --nagle-delay=50ms \
+        --reverse-proxy-listen=127.0.0.1:6443 \
+        --v=4
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # Install script that pulls everything from GCS using curl + REST API.
+  # On GCP VMs, uses the metadata server for access tokens (no credentials file needed).
+  - path: /usr/local/bin/install-from-bucket.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      GCS_BUCKET="GCS_BUCKET_PLACEHOLDER"
+      GCS_PREFIX="GCS_PREFIX_PLACEHOLDER"
+      LOCAL_BASE="/tmp/bucket-distributables"
+
+      # ---- GCS REST API helpers using curl ----
+
+      # Extract a JSON string value using python3 (available in Ubuntu base).
+      json_get() {
+        python3 -c "import json,sys; print(json.load(sys.stdin)['$1'])"
+      }
+
+      # Obtain an OAuth2 access token from the GCE metadata server.
+      get_access_token() {
+        curl -sf -H "Metadata-Flavor: Google" \
+          "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
+          | json_get access_token
+      }
+
+      # Download a single object from GCS.
+      # Usage: gcs_download <gcs_object_name> <local_path>
+      gcs_download() {
+        local object="$1" dest="$2"
+        # URL-encode the object name (replace / with %2F).
+        local encoded
+        encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$object', safe=''))")
+        mkdir -p "$(dirname "$dest")"
+        curl -sf -o "$dest" \
+          -H "Authorization: Bearer $ACCESS_TOKEN" \
+          "https://storage.googleapis.com/storage/v1/b/${GCS_BUCKET}/o/${encoded}?alt=media"
+      }
+
+      # List objects in GCS under a prefix.
+      # Returns one object name per line.
+      gcs_list() {
+        local prefix="$1"
+        local encoded_prefix
+        encoded_prefix=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$prefix', safe=''))")
+        local url="https://storage.googleapis.com/storage/v1/b/${GCS_BUCKET}/o?prefix=${encoded_prefix}&maxResults=1000"
+        local next_page_token=""
+
+        while true; do
+          local page_url="$url"
+          if [ -n "$next_page_token" ]; then
+            page_url="${url}&pageToken=${next_page_token}"
+          fi
+
+          local response
+          response=$(curl -sf -H "Authorization: Bearer $ACCESS_TOKEN" "$page_url")
+
+          echo "$response" | python3 -c "
+      import json, sys
+      data = json.load(sys.stdin)
+      for item in data.get('items', []):
+          print(item['name'])
+      " 2>/dev/null || true
+
+          next_page_token=$(echo "$response" | python3 -c "
+      import json, sys
+      data = json.load(sys.stdin)
+      print(data.get('nextPageToken', ''))
+      " 2>/dev/null || true)
+
+          if [ -z "$next_page_token" ]; then
+            break
+          fi
+        done
+      }
+
+      # ---- Main install logic ----
+
+      echo "==> Obtaining GCS access token from metadata server..."
+      ACCESS_TOKEN=$(get_access_token)
+      if [ -z "$ACCESS_TOKEN" ]; then
+        echo "ERROR: Failed to obtain access token from metadata server"
+        exit 1
+      fi
+      echo "==> Access token obtained."
+
+      # Detect architecture.
+      ARCH=$(uname -m)
+      case "$ARCH" in
+        x86_64)  ARCH_SUFFIX="amd64" ;;
+        aarch64) ARCH_SUFFIX="arm64" ;;
+        *) echo "ERROR: unsupported arch $ARCH"; exit 1 ;;
+      esac
+
+      ARCH_DIR="$LOCAL_BASE/$ARCH_SUFFIX"
+      mkdir -p "$ARCH_DIR/debs"
+
+      echo "==> Downloading distributables from gs://${GCS_BUCKET}/${GCS_PREFIX}distributables/${ARCH_SUFFIX}/..."
+
+      # List and download all arch-specific distributables.
+      DIST_PREFIX="${GCS_PREFIX}distributables/${ARCH_SUFFIX}/"
+      gcs_list "$DIST_PREFIX" | while IFS= read -r obj; do
+        # Strip the GCS prefix to get the relative path.
+        rel="${obj#${DIST_PREFIX}}"
+        [ -z "$rel" ] && continue
+        echo "    downloading: $rel"
+        gcs_download "$obj" "$ARCH_DIR/$rel"
+      done
+
+      # Download containerd.service (architecture-independent).
+      echo "    downloading: containerd.service"
+      gcs_download "${GCS_PREFIX}distributables/containerd.service" "$LOCAL_BASE/containerd.service"
+
+      echo "==> Installing from downloaded distributables ($ARCH_DIR)..."
+
+      # Install required deb packages (offline, ignore errors for optional deps)
+      if ls "$ARCH_DIR/debs"/*.deb >/dev/null 2>&1; then
+        echo "==> Installing deb packages..."
+        dpkg -i "$ARCH_DIR/debs"/*.deb 2>&1 || true
+      fi
+
+      # Install containerd
+      if [ ! -f /usr/local/bin/containerd ]; then
+        echo "==> Installing containerd..."
+        tar -C /usr/local -xzf "$ARCH_DIR/containerd.tar.gz"
+        cp "$LOCAL_BASE/containerd.service" /etc/systemd/system/containerd.service
+        cp "$ARCH_DIR/runc" /usr/local/sbin/runc
+        chmod +x /usr/local/sbin/runc
+        mkdir -p /opt/cni/bin
+        tar -C /opt/cni/bin -xzf "$ARCH_DIR/cni-plugins.tgz"
+      else
+        echo "==> containerd already installed, skipping"
+      fi
+
+      # Install minimal CNI config (bridge + host-local IPAM).
+      mkdir -p /etc/cni/net.d
+      echo '{"cniVersion":"1.0.0","name":"bridge","plugins":[{"type":"bridge","bridge":"cni0","isGateway":true,"ipMasq":true,"ipam":{"type":"host-local","subnet":"10.244.0.0/24"}},{"type":"loopback"}]}' > /etc/cni/net.d/10-bridge.conflist
+
+      # Install kubelet and kubectl
+      echo "==> Installing kubelet and kubectl..."
+      cp "$ARCH_DIR/kubelet" /usr/local/bin/kubelet
+      chmod +x /usr/local/bin/kubelet
+      cp "$ARCH_DIR/kubectl" /usr/local/bin/kubectl
+      chmod +x /usr/local/bin/kubectl
+
+      # Install bucket-proxy-agent
+      echo "==> Installing bucket-proxy-agent..."
+      if [ -f "$ARCH_DIR/bucket-proxy-agent" ]; then
+        cp "$ARCH_DIR/bucket-proxy-agent" /usr/local/bin/bucket-proxy-agent
+        chmod +x /usr/local/bin/bucket-proxy-agent
+      else
+        echo "WARNING: bucket-proxy-agent not found in $ARCH_DIR"
+      fi
+
+      # Install OCI Distribution registry
+      echo "==> Installing registry..."
+      if [ -f "$ARCH_DIR/registry" ]; then
+        cp "$ARCH_DIR/registry" /usr/local/bin/registry
+        chmod +x /usr/local/bin/registry
+      else
+        echo "WARNING: registry binary not found in $ARCH_DIR"
+      fi
+
+      # Start containerd
+      echo "==> Starting containerd..."
+      systemctl daemon-reload
+      systemctl enable --now containerd
+      sleep 3
+
+      # Download public PKI material from GCS.
+      # The kubelet kubeconfig (containing the private key) is injected via
+      # cloud-init and is already at /etc/kubernetes/kubelet.kubeconfig.
+      # The node ID is baked into the systemd units by setup.sh at render time.
+      echo "==> Downloading PKI from GCS..."
+      gcs_download "${GCS_PREFIX}pki/ca.crt" /etc/kubernetes/pki/ca.crt
+
+      # Start services
+      echo "==> Starting services..."
+      systemctl daemon-reload
+
+      # Start registry and wait for readiness before kubelet
+      if [ -f /usr/local/bin/registry ]; then
+        echo "==> Starting OCI registry..."
+        systemctl enable --now bucket-registry
+        for i in $(seq 1 30); do
+          if curl -sf http://127.0.0.1:5000/v2/ >/dev/null 2>&1; then
+            echo "==> Registry is ready."
+            break
+          fi
+          if [ "$i" -eq 30 ]; then
+            echo "WARNING: Registry did not become ready in time, continuing anyway."
+          fi
+          sleep 1
+        done
+
+        # Pre-pull the sandbox (pause) image into containerd's image store.
+        # The _default hosts.toml mirror doesn't reliably intercept CRI sandbox
+        # image pulls, so we pull directly from the local registry and re-tag.
+        echo "==> Pre-pulling sandbox image..."
+        ctr -n k8s.io images pull --plain-http 127.0.0.1:5000/registry.k8s.io/pause:3.9
+        ctr -n k8s.io images tag 127.0.0.1:5000/registry.k8s.io/pause:3.9 registry.k8s.io/pause:3.9
+      fi
+
+      if [ -f /etc/kubernetes/kubelet.kubeconfig ] && \
+         [ -f /usr/local/bin/bucket-proxy-agent ]; then
+        systemctl enable --now bucket-proxy-agent
+        systemctl enable --now kubelet
+      else
+        echo "WARNING: Skipping service start — missing kubeconfig or agent binary"
+      fi
+
+      # Clean up downloaded distributables
+      rm -rf "$LOCAL_BASE"
+
+      echo "==> Installation from bucket complete."

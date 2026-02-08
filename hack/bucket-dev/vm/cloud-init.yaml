@@ -347,6 +347,13 @@ write_files:
           fi
           sleep 1
         done
+
+        # Pre-pull the sandbox (pause) image into containerd's image store.
+        # The _default hosts.toml mirror doesn't reliably intercept CRI sandbox
+        # image pulls, so we pull directly from the local registry and re-tag.
+        echo "==> Pre-pulling sandbox image..."
+        ctr -n k8s.io images pull --plain-http 127.0.0.1:5000/registry.k8s.io/pause:3.9
+        ctr -n k8s.io images tag 127.0.0.1:5000/registry.k8s.io/pause:3.9 registry.k8s.io/pause:3.9
       fi
 
       if [ -f /etc/kubernetes/kubelet.kubeconfig ] && \
