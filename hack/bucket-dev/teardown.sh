@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# teardown.sh — Tear down the bucket-based Konnectivity dev environment.
+# teardown.sh — Tear down the entire bucket-based Konnectivity dev environment.
+#
+# Discovers all worker VMs (from the overlay cluster and the VM backend),
+# tears down each one, then tears down the control plane.
 #
 # Environment variables:
 #   VM_BACKEND           — "multipass" (default) or "gcp"
@@ -31,9 +34,6 @@ if [ -f "$SCRIPT_DIR/demo.env" ]; then
     set +a
 fi
 
-CLUSTER_NAME="bucket-dev"
-VM_NAME="bucket-agent-vm"
-BUCKET_DIR="/tmp/bucket-dev"
 PKI_DIR="/tmp/bucket-dev-pki"
 VM_BACKEND="${VM_BACKEND:-multipass}"
 GCP_PROJECT="${GCP_PROJECT:-}"
@@ -43,52 +43,62 @@ log() { echo "==> $*"; }
 
 OVERLAY_KUBECONFIG="${PKI_DIR}/admin.kubeconfig"
 
-# Drain and delete the node from the overlay cluster before destroying the VM.
+# ============================================================
+# 1. Discover all worker node IDs
+# ============================================================
+# Collect from both the overlay cluster and the VM backend to catch
+# VMs that may not have registered (or whose registration was lost).
+declare -A WORKER_IDS
+
+# Source 1: overlay cluster nodes.
 if [ -f "$OVERLAY_KUBECONFIG" ]; then
     NODES=$(kubectl --kubeconfig="$OVERLAY_KUBECONFIG" get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
-    if [ -n "$NODES" ]; then
-        for node in $NODES; do
-            log "Draining overlay node: $node"
-            kubectl --kubeconfig="$OVERLAY_KUBECONFIG" drain "$node" \
-                --ignore-daemonsets --delete-emptydir-data --force --timeout=30s 2>/dev/null || true
-            log "Deleting overlay node: $node"
-            kubectl --kubeconfig="$OVERLAY_KUBECONFIG" delete node "$node" --timeout=15s 2>/dev/null || true
+    for node in $NODES; do
+        WORKER_IDS["$node"]=1
+    done
+fi
+
+# Source 2: VM backend — look for VMs matching the bucket-agent-* naming pattern.
+if [ "$VM_BACKEND" = "gcp" ]; then
+    if [ -n "$GCP_PROJECT" ]; then
+        GCP_VMS=$(gcloud compute instances list \
+            --project="$GCP_PROJECT" \
+            --zones="$GCP_ZONE" \
+            --filter="name~'^bucket-agent-'" \
+            --format="value(name)" 2>/dev/null || true)
+        for vm in $GCP_VMS; do
+            WORKER_IDS["$vm"]=1
         done
     fi
-fi
-
-if [ "$VM_BACKEND" = "gcp" ]; then
-    log "Deleting GCP VM: $VM_NAME"
-    gcloud compute instances delete "$VM_NAME" \
-        --project="$GCP_PROJECT" --zone="$GCP_ZONE" --quiet 2>/dev/null || true
 else
-    # Stop services in VM first so they don't write more files as root.
-    if multipass info "$VM_NAME" &>/dev/null; then
-        log "Stopping services in VM"
-        multipass exec "$VM_NAME" -- sudo systemctl stop bucket-proxy-agent 2>/dev/null || true
-        multipass exec "$VM_NAME" -- sudo systemctl stop kubelet 2>/dev/null || true
-
-        # Clean up root-owned files in bucket before unmounting.
-        multipass exec "$VM_NAME" -- sudo rm -rf /mnt/bucket/node-to-control 2>/dev/null || true
-        multipass exec "$VM_NAME" -- sudo rm -rf /mnt/bucket/control-to-node 2>/dev/null || true
-
-        log "Unmounting and deleting Multipass VM: $VM_NAME"
-        multipass umount "$VM_NAME" 2>/dev/null || true
-        multipass stop "$VM_NAME" 2>/dev/null || true
-    fi
-    multipass delete "$VM_NAME" --purge 2>/dev/null || true
+    # Multipass: list VMs whose name starts with bucket-agent-.
+    MULTIPASS_VMS=$(multipass list --format csv 2>/dev/null | tail -n +2 | cut -d, -f1 | grep '^bucket-agent-' || true)
+    for vm in $MULTIPASS_VMS; do
+        WORKER_IDS["$vm"]=1
+    done
 fi
 
-log "Deleting k3d cluster: $CLUSTER_NAME"
-k3d cluster delete "$CLUSTER_NAME" 2>/dev/null || true
+# ============================================================
+# 2. Tear down each worker
+# ============================================================
+if [ ${#WORKER_IDS[@]} -gt 0 ]; then
+    log "Found ${#WORKER_IDS[@]} worker(s): ${!WORKER_IDS[*]}"
+    for node_id in "${!WORKER_IDS[@]}"; do
+        log "Tearing down worker: $node_id"
+        NODE_ID="$node_id" "$SCRIPT_DIR/teardown-worker.sh"
+    done
+else
+    log "No worker VMs found."
+fi
 
-log "Removing bucket directory: $BUCKET_DIR"
-rm -rf "$BUCKET_DIR" 2>/dev/null || true
+# ============================================================
+# 3. Clean up transport data in GCS bucket
+# ============================================================
+"$SCRIPT_DIR/cleanup-bucket.sh"
 
-log "Removing PKI directory: $PKI_DIR"
-rm -rf "$PKI_DIR"
-
-log "Removing bucket-proxy-server Docker image"
-docker rmi bucket-proxy-server:dev 2>/dev/null || true
+# ============================================================
+# 4. Tear down the control plane
+# ============================================================
+"$SCRIPT_DIR/teardown-control-plane.sh"
 
 log "Teardown complete."

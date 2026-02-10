@@ -20,14 +20,14 @@
 #   2. Uploads the binary to GCS
 #   3. SSHs into the VM, downloads the new binary, and restarts the systemd service
 #
-# Usage: ./redeploy-agent.sh
+# Usage: NODE_ID=bucket-agent-XXXX ./redeploy-agent.sh
 #
 # Environment variables:
+#   NODE_ID              — node ID / VM name (required)
 #   VM_BACKEND           — "multipass" (default) or "gcp"
 #   GCS_CREDENTIALS_FILE — path to GCS credentials JSON file (required)
 #   GCS_BUCKET           — GCS bucket name (required)
 #   GCS_PREFIX           — key prefix within the bucket (default: "bucket-dev/")
-#   VM_NAME              — VM name (default: "bucket-agent-vm")
 #
 # GCP-specific:
 #   GCP_PROJECT          — GCP project ID
@@ -46,7 +46,7 @@ if [ -f "$SCRIPT_DIR/demo.env" ]; then
 fi
 
 VM_BACKEND="${VM_BACKEND:-multipass}"
-VM_NAME="${VM_NAME:-bucket-agent-vm}"
+NODE_ID="${NODE_ID:?NODE_ID environment variable is required}"
 GCS_CREDENTIALS_FILE="${GCS_CREDENTIALS_FILE:-}"
 GCS_BUCKET="${GCS_BUCKET:-}"
 GCS_PREFIX="${GCS_PREFIX:-bucket-dev/}"
@@ -107,11 +107,11 @@ gcloud storage cp "$REPO_ROOT/bin/bucket-proxy-agent-linux-${GOARCH}" "$GCS_STAG
 # 3. SSH into VM, download binary, restart service
 # ============================================================
 
-echo "==> Deploying to VM ($VM_BACKEND: $VM_NAME)..."
+echo "==> Deploying to VM ($VM_BACKEND: $NODE_ID)..."
 
 if [ "$VM_BACKEND" = "gcp" ]; then
     # GCP: the VM uses its service account to access GCS via the metadata server.
-    gcloud compute ssh "$VM_NAME" \
+    gcloud compute ssh "$NODE_ID" \
         --project="$GCP_PROJECT" --zone="$GCP_ZONE" \
         --tunnel-through-iap \
         --command="$(cat <<REMOTE
@@ -138,7 +138,7 @@ REMOTE
 )"
 else
     # Multipass: the VM uses a credentials file for GCS access.
-    multipass exec "$VM_NAME" -- bash -c "$(cat <<REMOTE
+    multipass exec "$NODE_ID" -- bash -c "$(cat <<REMOTE
 set -euo pipefail
 CREDS_FILE='/etc/gcs/application_default_credentials.json'
 json_get() { python3 -c "import json,sys; print(json.load(sys.stdin)['\$1'])"; }
@@ -173,7 +173,7 @@ echo "==> Agent redeployed successfully!"
 echo ""
 echo "Check logs with:"
 if [ "$VM_BACKEND" = "gcp" ]; then
-    echo "  gcloud compute ssh $VM_NAME --project=$GCP_PROJECT --zone=$GCP_ZONE --tunnel-through-iap --command='sudo journalctl -u bucket-proxy-agent -f'"
+    echo "  gcloud compute ssh $NODE_ID --project=$GCP_PROJECT --zone=$GCP_ZONE --tunnel-through-iap --command='sudo journalctl -u bucket-proxy-agent -f'"
 else
-    echo "  multipass exec $VM_NAME -- sudo journalctl -u bucket-proxy-agent -f"
+    echo "  multipass exec $NODE_ID -- sudo journalctl -u bucket-proxy-agent -f"
 fi
