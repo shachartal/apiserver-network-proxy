@@ -44,6 +44,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Auto-source demo.env if present.
+if [ -f "$SCRIPT_DIR/demo.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/demo.env"
+    set +a
+fi
+
 CLUSTER_NAME="bucket-dev"
 NAMESPACE="overlay-system"
 BUCKET_DIR="/tmp/bucket-dev"
@@ -257,7 +264,9 @@ kubectl apply -f "$SCRIPT_DIR/manifests/etcd.yaml"
 echo "Waiting for etcd to be ready..."
 kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/etcd --timeout=60s
 
-kubectl apply -f "$SCRIPT_DIR/manifests/apiserver.yaml"
+sed -e "s|GCS_BUCKET_PLACEHOLDER|${GCS_BUCKET}|g" \
+    -e "s|GCS_PREFIX_PLACEHOLDER|${GCS_PREFIX}|g" \
+    "$SCRIPT_DIR/manifests/apiserver.yaml" | kubectl apply -f -
 
 echo "Waiting for kube-apiserver to be ready..."
 kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/kube-apiserver --timeout=120s

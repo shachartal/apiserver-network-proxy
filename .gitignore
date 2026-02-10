@@ -20,3 +20,6 @@ konnectivity-client/client.out
 konnectivity-client/client.html
 
 tests.test
+
+# bucket-dev local config
+hack/bucket-dev/demo.env
