@@ -33,6 +33,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Auto-source demo.env if present.
+if [ -f "$SCRIPT_DIR/demo.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/demo.env"
+    set +a
+fi
+
 BUCKET_DIR="/tmp/bucket-dev"
 GCS_CREDENTIALS_FILE="${GCS_CREDENTIALS_FILE:-}"
 GCS_BUCKET="${GCS_BUCKET:-}"

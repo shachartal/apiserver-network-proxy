@@ -52,8 +52,8 @@ spec:
       command:
         - /bucket-proxy-server
         - --store-type=gcs
-        - --gcs-bucket=shachar-test
-        - --gcs-prefix=bucket-dev/
+        - --gcs-bucket=GCS_BUCKET_PLACEHOLDER
+        - --gcs-prefix=GCS_PREFIX_PLACEHOLDER
         - --gcs-credentials-file=/gcs/application_default_credentials.json
         - --uds-name=/run/konnectivity/konnectivity.socket
         - --server-id=bucket-server-0

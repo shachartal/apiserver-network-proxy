@@ -34,6 +34,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Auto-source demo.env if present.
+if [ -f "$SCRIPT_DIR/demo.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/demo.env"
+    set +a
+fi
+
 BENCHMARK_DURATION="${BENCHMARK_DURATION:-600}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-60}"
 VM_NAME="${VM_NAME:-bucket-agent-vm}"

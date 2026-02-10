@@ -28,8 +28,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Auto-source demo.env if present.
+if [ -f "$SCRIPT_DIR/demo.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/demo.env"
+    set +a
+fi
+
 CLUSTER_NAME="bucket-dev"
 NAMESPACE="overlay-system"
+GCS_BUCKET="${GCS_BUCKET:-}"
+GCS_PREFIX="${GCS_PREFIX:-bucket-dev/}"
 
 # Detect target architecture.
 HOST_ARCH="$(uname -m)"
@@ -64,8 +73,14 @@ echo "==> Restarting kube-apiserver pod..."
 # Since it's not a Deployment, we need to re-apply the manifest.
 kubectl -n "$NAMESPACE" delete pod kube-apiserver --wait=false 2>/dev/null || true
 
-# Re-apply the manifest to recreate the pod.
-kubectl apply -f "$SCRIPT_DIR/manifests/apiserver.yaml"
+# Re-apply the manifest to recreate the pod (with templated GCS settings).
+if [ -z "$GCS_BUCKET" ]; then
+    echo "ERROR: GCS_BUCKET must be set (or use demo.env)"
+    exit 1
+fi
+sed -e "s|GCS_BUCKET_PLACEHOLDER|${GCS_BUCKET}|g" \
+    -e "s|GCS_PREFIX_PLACEHOLDER|${GCS_PREFIX}|g" \
+    "$SCRIPT_DIR/manifests/apiserver.yaml" | kubectl apply -f -
 
 echo "==> Waiting for kube-apiserver to be ready..."
 kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/kube-apiserver --timeout=60s
