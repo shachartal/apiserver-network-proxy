@@ -368,13 +368,29 @@ func (r *RegionalPoller) downloadAndDispatch(refs []messageRef) {
 
 			_ = r.store.Delete(r.ctx, res.ref.key)
 
-			select {
-			case h.recvCh <- res.pkt:
-			case <-r.ctx.Done():
+			if !r.trySend(h.recvCh, res.pkt) {
+				// Channel was closed (node unregistered) or context cancelled.
 				return
 			}
 			expectedSeq++
 		}
+	}
+}
+
+// trySend attempts to send a packet on the channel, recovering from a panic
+// if the channel was closed concurrently by UnregisterNode.
+func (r *RegionalPoller) trySend(ch chan<- *client.Packet, pkt *client.Packet) (ok bool) {
+	defer func() {
+		if rv := recover(); rv != nil {
+			klog.V(4).InfoS("RegionalPoller send on closed channel (node unregistered concurrently)")
+			ok = false
+		}
+	}()
+	select {
+	case ch <- pkt:
+		return true
+	case <-r.ctx.Done():
+		return false
 	}
 }
 
