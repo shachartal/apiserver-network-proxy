@@ -48,13 +48,13 @@ OVERLAY_KUBECONFIG="${PKI_DIR}/admin.kubeconfig"
 # ============================================================
 # Collect from both the overlay cluster and the VM backend to catch
 # VMs that may not have registered (or whose registration was lost).
-declare -A WORKER_IDS
+WORKER_IDS=""
 
 # Source 1: overlay cluster nodes.
 if [ -f "$OVERLAY_KUBECONFIG" ]; then
     NODES=$(kubectl --kubeconfig="$OVERLAY_KUBECONFIG" get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
     for node in $NODES; do
-        WORKER_IDS["$node"]=1
+        WORKER_IDS="$WORKER_IDS $node"
     done
 fi
 
@@ -67,23 +67,26 @@ if [ "$VM_BACKEND" = "gcp" ]; then
             --filter="name~'^bucket-agent-'" \
             --format="value(name)" 2>/dev/null || true)
         for vm in $GCP_VMS; do
-            WORKER_IDS["$vm"]=1
+            WORKER_IDS="$WORKER_IDS $vm"
         done
     fi
 else
     # Multipass: list VMs whose name starts with bucket-agent-.
     MULTIPASS_VMS=$(multipass list --format csv 2>/dev/null | tail -n +2 | cut -d, -f1 | grep '^bucket-agent-' || true)
     for vm in $MULTIPASS_VMS; do
-        WORKER_IDS["$vm"]=1
+        WORKER_IDS="$WORKER_IDS $vm"
     done
 fi
+
+# Deduplicate (a node may appear in both the overlay cluster and the VM backend).
+WORKER_IDS=$(echo "$WORKER_IDS" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
 
 # ============================================================
 # 2. Tear down each worker
 # ============================================================
-if [ ${#WORKER_IDS[@]} -gt 0 ]; then
-    log "Found ${#WORKER_IDS[@]} worker(s): ${!WORKER_IDS[*]}"
-    for node_id in "${!WORKER_IDS[@]}"; do
+if [ -n "$WORKER_IDS" ]; then
+    log "Found worker(s):$WORKER_IDS"
+    for node_id in $WORKER_IDS; do
         log "Tearing down worker: $node_id"
         NODE_ID="$node_id" "$SCRIPT_DIR/teardown-worker.sh"
     done
