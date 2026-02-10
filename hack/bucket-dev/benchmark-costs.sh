@@ -24,7 +24,7 @@
 # Environment variables:
 #   BENCHMARK_DURATION  — total benchmark duration in seconds (default: 600)
 #   SAMPLE_INTERVAL     — seconds between metric snapshots (default: 60)
-#   VM_NAME             — VM name (default: bucket-agent-vm)
+#   NODE_ID             — node ID / VM name (required)
 #   VM_BACKEND          — "multipass" (default) or "gcp"
 #   GCP_PROJECT         — GCP project ID (required when VM_BACKEND=gcp)
 #   GCP_ZONE            — GCP zone (default: "us-east1-b")
@@ -43,7 +43,7 @@ fi
 
 BENCHMARK_DURATION="${BENCHMARK_DURATION:-600}"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-60}"
-VM_NAME="${VM_NAME:-bucket-agent-vm}"
+NODE_ID="${NODE_ID:?NODE_ID environment variable is required}"
 VM_BACKEND="${VM_BACKEND:-multipass}"
 GCP_PROJECT="${GCP_PROJECT:-}"
 GCP_ZONE="${GCP_ZONE:-us-east1-b}"
@@ -138,13 +138,13 @@ collect_metrics() {
         # Collect agent metrics.
         local agent_file="$OUTPUT_DIR/agent-${ts}.prom"
         if [ "$VM_BACKEND" = "gcp" ]; then
-            gcloud compute ssh "$VM_NAME" \
+            gcloud compute ssh "$NODE_ID" \
                 --project="$GCP_PROJECT" --zone="$GCP_ZONE" \
                 --tunnel-through-iap \
                 --command="curl -s http://127.0.0.1:${AGENT_ADMIN_PORT}/metrics" \
                 > "$agent_file" 2>/dev/null || true
         else
-            multipass exec "$VM_NAME" -- curl -s "http://127.0.0.1:${AGENT_ADMIN_PORT}/metrics" > "$agent_file" 2>/dev/null || true
+            multipass exec "$NODE_ID" -- curl -s "http://127.0.0.1:${AGENT_ADMIN_PORT}/metrics" > "$agent_file" 2>/dev/null || true
         fi
 
         # Collect server metrics via port-forward.
@@ -189,7 +189,7 @@ echo ""
 log "Generating cost report..."
 echo ""
 
-export VM_NAME NAMESPACE AGENT_ADMIN_PORT SERVER_ADMIN_PORT
+export NODE_ID NAMESPACE AGENT_ADMIN_PORT SERVER_ADMIN_PORT
 bash "$SCRIPT_DIR/show-costs.sh" "$OUTPUT_DIR"
 
 echo ""

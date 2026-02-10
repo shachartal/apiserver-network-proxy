@@ -25,7 +25,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-VM_NAME="${VM_NAME:-bucket-agent-vm}"
+NODE_ID="${NODE_ID:-}"
 NAMESPACE="${NAMESPACE:-overlay-system}"
 AGENT_ADMIN_PORT="${AGENT_ADMIN_PORT:-8094}"
 SERVER_ADMIN_PORT="${SERVER_ADMIN_PORT:-8095}"
@@ -41,7 +41,7 @@ fetch_agent_metrics() {
     if [ -n "$METRICS_DIR" ] && [ -f "$METRICS_DIR/agent-latest.prom" ]; then
         cat "$METRICS_DIR/agent-latest.prom"
     else
-        multipass exec "$VM_NAME" -- curl -s "http://127.0.0.1:${AGENT_ADMIN_PORT}/metrics" 2>/dev/null || echo ""
+        multipass exec "$NODE_ID" -- curl -s "http://127.0.0.1:${AGENT_ADMIN_PORT}/metrics" 2>/dev/null || echo ""
     fi
 }
 
@@ -100,7 +100,7 @@ if [ -z "$agent_metrics" ]; then
     echo "  [WARNING] Could not fetch agent metrics"
 else
     echo ""
-    echo "  AGENT (${VM_NAME}:${AGENT_ADMIN_PORT}):"
+    echo "  AGENT (${NODE_ID}:${AGENT_ADMIN_PORT}):"
     echo "$agent_metrics" | grep "^konnectivity_network_proxy_bucket_" | sed 's/^/    /'
 fi
 

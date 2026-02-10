@@ -92,11 +92,23 @@ Defined in `konnectivity-client/proto/client/client.proto`. Packet types: `DIAL_
 
 ### Dev Environment (Bucket Transport)
 
-Scripts in `hack/bucket-dev/`:
-- `setup.sh` — Creates k3d cluster + worker VM + GCS bucket
+Scripts in `hack/bucket-dev/` are split into control-plane and worker phases:
+
+Setup:
+- `setup.sh` — Convenience wrapper: runs `setup-control-plane.sh` then `setup-worker.sh`
+- `setup-control-plane.sh` — Creates k3d cluster, PKI, overlay pods (run once)
+- `setup-worker.sh` — Launches a worker VM with unique `NODE_ID` (can run multiple times)
+
+Teardown:
+- `teardown.sh` — Discovers all workers, tears them down, cleans GCS, removes control plane
+- `teardown-worker.sh` — Tears down a single worker by `NODE_ID`
+- `teardown-control-plane.sh` — Removes k3d cluster and local state
+- `cleanup-bucket.sh` — Deletes all transport messages from GCS (not distributables)
+
+Iteration:
 - `redeploy-server.sh` — Rebuilds and redeploys bucket-proxy-server
-- `benchmark-costs.sh` — 10-minute cost estimation run
-- `teardown.sh` — Drains overlay nodes, destroys VM and k3d cluster
+- `redeploy-agent.sh` — Rebuilds and redeploys agent to a VM (requires `NODE_ID`)
+- `benchmark-costs.sh` — 10-minute cost estimation run (requires `NODE_ID`)
 
 The worker VM backend is controlled by `VM_BACKEND`:
 - `multipass` (default) — Local VM, requires `multipass` CLI and a GCS credentials file

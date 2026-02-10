@@ -6,7 +6,7 @@ communicating with kubelets via GCS instead of gRPC.
 ## What you're demonstrating
 
 A Kubernetes control plane (kube-apiserver, etcd, controller-manager, scheduler)
-runs in a k3d cluster on your laptop. A worker VM runs a kubelet and
+runs in a k3d cluster on your laptop. One or more worker VMs run a kubelet and
 bucket-proxy-agent. The two sides communicate **exclusively through a GCS
 bucket** -- no direct network path exists between them. Every `kubectl exec`,
 pod creation, and log fetch flows as protobuf files through cloud storage.
@@ -83,7 +83,12 @@ cp demo.env.example demo.env
 Then run setup (all scripts auto-source `demo.env`):
 
 ```bash
+# Option A: all-in-one (control plane + one worker)
 ./setup.sh
+
+# Option B: step by step
+./setup-control-plane.sh   # k3d cluster, PKI, overlay pods
+./setup-worker.sh           # launches one worker VM (auto-generates NODE_ID)
 ```
 
 This creates:
@@ -104,6 +109,19 @@ Expected output:
 ```
 NAME                    STATUS   ROLES    AGE   VERSION
 bucket-agent-a1b2c3d4   Ready    <none>   30s   v1.30.0
+```
+
+### Step 3: Add more workers (optional)
+
+```bash
+# Each invocation creates a new worker with a unique NODE_ID
+./setup-worker.sh
+./setup-worker.sh
+
+# Or supply a specific NODE_ID
+NODE_ID=bucket-agent-mynode ./setup-worker.sh
+
+kubectl get nodes   # shows all registered workers
 ```
 
 ## Demo flows
@@ -192,7 +210,7 @@ Run a 10-minute benchmark that deploys a workload pod and measures GCS API calls
 
 ```bash
 cd hack/bucket-dev
-BENCHMARK_DURATION=600 ./benchmark-costs.sh
+NODE_ID=bucket-agent-XXXX BENCHMARK_DURATION=600 ./benchmark-costs.sh
 ```
 
 This produces a cost projection for 10, 100, and 1000 nodes.
@@ -212,30 +230,32 @@ Key things to watch for:
 
 ### Agent logs (bucket-proxy-agent on VM)
 
+Replace `$NODE_ID` with the actual node ID (e.g. `bucket-agent-a1b2c3d4`).
+
 For GCP:
 ```bash
-gcloud compute ssh bucket-agent-vm \
+gcloud compute ssh $NODE_ID \
   --project=$GCP_PROJECT --zone=$GCP_ZONE --tunnel-through-iap \
   --command='sudo journalctl -u bucket-proxy-agent -f'
 ```
 
 For multipass:
 ```bash
-multipass exec bucket-agent-vm -- sudo journalctl -u bucket-proxy-agent -f
+multipass exec $NODE_ID -- sudo journalctl -u bucket-proxy-agent -f
 ```
 
 ### Kubelet logs
 
 For GCP:
 ```bash
-gcloud compute ssh bucket-agent-vm \
+gcloud compute ssh $NODE_ID \
   --project=$GCP_PROJECT --zone=$GCP_ZONE --tunnel-through-iap \
   --command='sudo journalctl -u kubelet -f'
 ```
 
 For multipass:
 ```bash
-multipass exec bucket-agent-vm -- sudo journalctl -u kubelet -f
+multipass exec $NODE_ID -- sudo journalctl -u kubelet -f
 ```
 
 ### Prometheus metrics
@@ -249,12 +269,12 @@ curl -s http://localhost:8095/metrics | grep konnectivity
 Agent metrics:
 ```bash
 # GCP
-gcloud compute ssh bucket-agent-vm \
+gcloud compute ssh $NODE_ID \
   --project=$GCP_PROJECT --zone=$GCP_ZONE --tunnel-through-iap \
   --command='curl -s http://127.0.0.1:8094/metrics' | grep konnectivity
 
 # Multipass
-multipass exec bucket-agent-vm -- curl -s http://127.0.0.1:8094/metrics | grep konnectivity
+multipass exec $NODE_ID -- curl -s http://127.0.0.1:8094/metrics | grep konnectivity
 ```
 
 ### Overlay control plane health
@@ -278,7 +298,7 @@ cd hack/bucket-dev
 ./redeploy-server.sh
 
 # Agent changes only — rebuilds binary, uploads to GCS, restarts service on VM (~30s)
-./redeploy-agent.sh
+NODE_ID=bucket-agent-XXXX ./redeploy-agent.sh
 ```
 
 To force re-upload of distributables:
@@ -297,26 +317,40 @@ After server restart, also restart the agent + kubelet on the VM to reset
 sequence counters:
 ```bash
 # GCP
-gcloud compute ssh bucket-agent-vm \
+gcloud compute ssh $NODE_ID \
   --project=$GCP_PROJECT --zone=$GCP_ZONE --tunnel-through-iap \
   --command='sudo systemctl restart bucket-proxy-agent && sudo systemctl restart kubelet'
 
 # Multipass
-multipass exec bucket-agent-vm -- sudo systemctl restart bucket-proxy-agent
-multipass exec bucket-agent-vm -- sudo systemctl restart kubelet
+multipass exec $NODE_ID -- sudo systemctl restart bucket-proxy-agent
+multipass exec $NODE_ID -- sudo systemctl restart kubelet
 ```
 
 ## Teardown
 
 ```bash
 cd hack/bucket-dev
+
+# Tear down a single worker (keeps control plane running)
+NODE_ID=bucket-agent-XXXX ./teardown-worker.sh
+
+# Tear down just the control plane (workers should be removed first)
+./teardown-control-plane.sh
+
+# Delete all transport messages from GCS (heartbeats, data, registrations)
+./cleanup-bucket.sh
+
+# Tear down everything (discovers all workers, cleans bucket, removes control plane)
 ./teardown.sh
 ```
 
-This deletes: the VM, the k3d cluster, local PKI files, and the Docker image.
-It does **not** delete GCS distributables (so next `setup.sh` is faster).
+`teardown.sh` discovers all worker VMs by querying both the overlay cluster and
+the VM backend for names matching `bucket-agent-*`. It also runs
+`cleanup-bucket.sh` to remove stale transport data from GCS.
 
-To also clean up GCS:
+It does **not** delete GCS distributables (so next setup is faster).
+
+To also clean up GCS distributables:
 ```bash
 gcloud storage rm -r "gs://${GCS_BUCKET}/bucket-dev/"
 ```
