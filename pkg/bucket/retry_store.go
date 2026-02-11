@@ -135,5 +135,6 @@ func (s *RetryStore) retry(ctx context.Context, op, key string, fn func() error)
 		}
 	}
 
+	klog.ErrorS(lastErr, "Store operation failed after all retries", "op", op, "key", key, "attempts", s.policy.MaxRetries+1)
 	return fmt.Errorf("%s %q failed after %d attempts: %w", op, key, s.policy.MaxRetries+1, lastErr)
 }

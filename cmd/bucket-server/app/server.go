@@ -90,7 +90,7 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	if err != nil {
 		return fmt.Errorf("failed to create store: %v", err)
 	}
-	store := bucket.NewMetricsStore(rawStore)
+	store := bucket.NewMetricsStore(bucket.NewRetryStore(rawStore, bucket.DefaultRetryPolicy()))
 	p.store = store
 	p.nagleDelay = o.NagleDelay
 	p.reverseProxyTarget = o.ReverseProxyTarget
