@@ -18,6 +18,8 @@ package bucket
 
 import (
 	"context"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +27,19 @@ import (
 
 	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 )
+
+// errStore wraps a Store and fails the first N Put calls.
+type errStore struct {
+	Store
+	failCount atomic.Int32 // remaining Puts to fail
+}
+
+func (s *errStore) Put(ctx context.Context, key string, data []byte) error {
+	if s.failCount.Add(-1) >= 0 {
+		return fmt.Errorf("injected put failure")
+	}
+	return s.Store.Put(ctx, key, data)
+}
 
 // collectSentPackets reads all packets written to the store under sendPrefix.
 func collectSentPackets(t *testing.T, store *FSStore, prefix string) []*client.Packet {
@@ -282,5 +297,50 @@ func TestNagle_DisabledSendsImmediately(t *testing.T) {
 	}
 	if string(pkts[0].GetData().Data) != "immediate" {
 		t.Errorf("Expected 'immediate', got %q", string(pkts[0].GetData().Data))
+	}
+}
+
+func TestSendImmediate_NoSeqAdvanceOnPutFailure(t *testing.T) {
+	dir := t.TempDir()
+	fsStore := NewFSStore(dir)
+	es := &errStore{Store: fsStore}
+	es.failCount.Store(2) // fail the first 2 Puts
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	transport := newSendOnlyTransport(ctx, es, "test/send/", 0)
+	defer transport.Close()
+
+	// First two sends should fail.
+	for i := 0; i < 2; i++ {
+		if err := transport.Send(makeClosePacket(int64(i))); err == nil {
+			t.Fatalf("Send %d: expected error, got nil", i)
+		}
+	}
+
+	// Next two sends should succeed.
+	for i := 0; i < 2; i++ {
+		if err := transport.Send(makeClosePacket(int64(i + 10))); err != nil {
+			t.Fatalf("Send %d: %v", i+2, err)
+		}
+	}
+
+	// Verify the stored keys have contiguous sequence numbers 1, 2 (no gaps).
+	keys, err := fsStore.List(context.Background(), "test/send/")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("Expected 2 keys, got %d: %v", len(keys), keys)
+	}
+	for i, key := range keys {
+		seq, err := parseSeqFromKey(key)
+		if err != nil {
+			t.Fatalf("parseSeqFromKey(%q): %v", key, err)
+		}
+		if seq != uint64(i+1) {
+			t.Errorf("Key %d: expected seq %d, got %d", i, i+1, seq)
+		}
 	}
 }

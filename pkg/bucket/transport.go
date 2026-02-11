@@ -23,7 +23,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -54,7 +53,8 @@ type BucketTransport struct {
 	store        Store
 	sendPrefix   string // e.g. "control-to-node/node-1/"
 	recvPrefix   string // e.g. "node-to-control/node-1/"
-	sendSeq      atomic.Uint64
+	sendMu       sync.Mutex
+	sendSeq      uint64
 	recvSeq      uint64 // only accessed by polling goroutine
 	pollInterval time.Duration
 	adaptive     bool // when true, dynamically adjust poll interval
@@ -143,18 +143,24 @@ func (t *BucketTransport) Send(pkt *client.Packet) error {
 }
 
 // sendImmediate marshals and writes a single packet to the bucket.
+// The sequence number is only advanced after a successful Put, so a
+// transient failure does not leave a gap that blocks the receiver.
 func (t *BucketTransport) sendImmediate(pkt *client.Packet) error {
 	data, err := proto.Marshal(pkt)
 	if err != nil {
 		return fmt.Errorf("marshal packet: %w", err)
 	}
 
-	seq := t.sendSeq.Add(1)
+	t.sendMu.Lock()
+	defer t.sendMu.Unlock()
+
+	seq := t.sendSeq + 1
 	key := fmt.Sprintf("%s%0*d%s", t.sendPrefix, seqWidth, seq, fileSuffix)
 
 	if err := t.store.Put(t.ctx, key, data); err != nil {
 		return fmt.Errorf("bucket put %s: %w", key, err)
 	}
+	t.sendSeq = seq
 	return nil
 }
 
