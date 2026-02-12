@@ -80,7 +80,7 @@ Replaces gRPC between server and agent with object storage. Messages are protobu
 Key components:
 - **`BucketTransport`** (`transport.go`) — Send/Recv semantics over a Store, with Nagle buffering for small packets
 - **`Store` interface** (`store.go`) — Put/Get/List/ListRecursive/Delete. Implementations: `GCSStore` (production), `FSStore` (testing), `RetryStore` (wrapper), `MetricsStore` (Prometheus instrumentation)
-- **`RegionalPoller`** (`regional_poller.go`) — Single `ListRecursive` call polls messages for ALL nodes, dispatches to per-node channels. Adaptive interval (500ms–10s)
+- **`RegionalPoller`** (`regional_poller.go`) — Single `ListRecursive` call polls messages for ALL nodes, dispatches to per-node channels. Adaptive interval (500ms–10s). Implements 5-minute grace period for unregistered nodes before deleting their messages, allowing agents to start before server discovery completes.
 - **`HeartbeatMonitor`** (`heartbeat.go`) — Receives heartbeat updates from RegionalPoller via `UpdateHeartbeat` callback. Only scans for stale nodes in its own tick loop.
 - **`BucketAgent`** (`agent.go`) — Bridges bucket packets to local TCP connections (mirrors `pkg/agent/` for gRPC mode)
 - **`ReverseProxyHandler`** (`reverse_proxy.go`) — Handles reverse tunnel: agent sends HTTP requests to server, server proxies to a target (e.g., kubelet API)

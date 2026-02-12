@@ -44,6 +44,10 @@ type RegionalPoller struct {
 	mu       sync.RWMutex
 	handlers map[string]*nodeHandler // nodeID → handler
 
+	// unknownNodeFirstSeen tracks when we first saw files for nodes that aren't registered.
+	// Used to implement grace period before deleting their messages.
+	unknownNodeFirstSeen map[string]time.Time
+
 	// workerCount controls how many concurrent GET requests are made
 	// after LIST discovery. Defaults to DefaultWorkerCount.
 	workerCount int
@@ -70,6 +74,9 @@ type nodeHandler struct {
 const (
 	// DefaultWorkerCount is the default number of concurrent download workers.
 	DefaultWorkerCount = 10
+	// unknownNodeGracePeriod is how long to keep messages for unregistered nodes
+	// before deleting them. This gives agents time to be discovered via heartbeat.
+	unknownNodeGracePeriod = 5 * time.Minute
 )
 
 // NewRegionalPoller creates a poller that watches the given prefix for messages
@@ -77,12 +84,13 @@ const (
 func NewRegionalPoller(ctx context.Context, store Store, prefix string) *RegionalPoller {
 	ctx, cancel := context.WithCancel(ctx)
 	return &RegionalPoller{
-		store:       store,
-		prefix:      ensureTrailingSlash(prefix),
-		handlers:    make(map[string]*nodeHandler),
-		workerCount: DefaultWorkerCount,
-		ctx:         ctx,
-		cancel:      cancel,
+		store:                store,
+		prefix:               ensureTrailingSlash(prefix),
+		handlers:             make(map[string]*nodeHandler),
+		unknownNodeFirstSeen: make(map[string]time.Time),
+		workerCount:          DefaultWorkerCount,
+		ctx:                  ctx,
+		cancel:               cancel,
 	}
 }
 
@@ -106,6 +114,8 @@ func (r *RegionalPoller) RegisterNode(nodeID string) <-chan *client.Packet {
 		recvCh: make(chan *client.Packet, 100),
 	}
 	r.handlers[nodeID] = h
+	// Node is now registered, remove from unknown tracking.
+	delete(r.unknownNodeFirstSeen, nodeID)
 	klog.V(2).InfoS("RegionalPoller: node registered", "nodeID", nodeID)
 	return h.recvCh
 }
@@ -205,21 +215,22 @@ func (r *RegionalPoller) pollOnce() bool {
 			continue
 		}
 
-		// Skip if we don't have a handler for this node yet.
-		h, ok := r.handlers[nodeID]
-		if !ok {
-			continue
-		}
-
 		seq, err := parseSeqFromKey(key)
 		if err != nil {
 			continue
 		}
-		if seq <= h.recvSeq {
-			// Already processed; queue for deletion.
+
+		// Check if we have a handler for this node.
+		h, ok := r.handlers[nodeID]
+		if ok && seq <= h.recvSeq {
+			// Already processed; delete duplicate.
+			klog.V(4).InfoS("Deleting duplicate message", "nodeID", nodeID, "key", key, "seq", seq, "currentSeq", h.recvSeq)
 			_ = r.store.Delete(r.ctx, key)
 			continue
 		}
+
+		// Add ref for both registered and unregistered nodes.
+		// Unregistered nodes will be handled with grace period in downloadAndDispatch.
 		refs = append(refs, messageRef{nodeID: nodeID, key: key, seq: seq})
 	}
 	r.mu.RUnlock()
@@ -343,7 +354,45 @@ func (r *RegionalPoller) downloadAndDispatch(refs []messageRef) {
 		r.mu.RUnlock()
 
 		if !ok {
+			// Node not registered. Check if grace period has elapsed before deleting.
+			r.mu.Lock()
+			firstSeen, known := r.unknownNodeFirstSeen[nodeID]
+			if !known {
+				// First time seeing files for this unknown node — record timestamp.
+				r.unknownNodeFirstSeen[nodeID] = time.Now()
+				r.mu.Unlock()
+				klog.V(3).InfoS("RegionalPoller: found files for unregistered node, starting grace period",
+					"nodeID", nodeID, "fileCount", len(nodeResults), "gracePeriod", unknownNodeGracePeriod)
+				for _, res := range nodeResults {
+					klog.V(4).InfoS("Preserving file for unregistered node (grace period start)",
+						"nodeID", nodeID, "key", res.ref.key, "seq", res.ref.seq)
+				}
+				continue
+			}
+			r.mu.Unlock()
+
+			age := time.Since(firstSeen)
+			// Check if grace period has elapsed.
+			if age < unknownNodeGracePeriod {
+				// Still within grace period — keep messages for next poll.
+				klog.V(4).InfoS("RegionalPoller: preserving files for unregistered node within grace period",
+					"nodeID", nodeID, "fileCount", len(nodeResults), "age", age, "gracePeriod", unknownNodeGracePeriod)
+				for _, res := range nodeResults {
+					klog.V(5).InfoS("Preserving file within grace period",
+						"nodeID", nodeID, "key", res.ref.key, "seq", res.ref.seq, "age", age)
+				}
+				continue
+			}
+
+			// Grace period elapsed — delete stale messages.
+			klog.V(2).InfoS("RegionalPoller: deleting stale files for unregistered node after grace period",
+				"nodeID", nodeID, "age", age, "fileCount", len(nodeResults))
+			r.mu.Lock()
+			delete(r.unknownNodeFirstSeen, nodeID)
+			r.mu.Unlock()
 			for _, res := range nodeResults {
+				klog.V(3).InfoS("Deleting expired file for unregistered node",
+					"nodeID", nodeID, "key", res.ref.key, "seq", res.ref.seq, "age", age, "reason", "grace-period-expired")
 				_ = r.store.Delete(r.ctx, res.ref.key)
 			}
 			continue
@@ -359,6 +408,13 @@ func (r *RegionalPoller) downloadAndDispatch(refs []messageRef) {
 				// Remaining messages stay in the bucket for next poll.
 				klog.V(4).InfoS("RegionalPoller gap detected, deferring remaining messages",
 					"nodeID", nodeID, "expected", expectedSeq, "got", res.ref.seq)
+				// Log which files are being deferred (not deleted).
+				for _, deferred := range nodeResults {
+					if deferred.ref.seq >= res.ref.seq {
+						klog.V(5).InfoS("Deferring file due to gap",
+							"nodeID", nodeID, "key", deferred.ref.key, "seq", deferred.ref.seq, "reason", "sequence-gap")
+					}
+				}
 				break
 			}
 
@@ -366,6 +422,8 @@ func (r *RegionalPoller) downloadAndDispatch(refs []messageRef) {
 			h.recvSeq = res.ref.seq
 			r.mu.Unlock()
 
+			klog.V(5).InfoS("Deleting message after delivery",
+				"nodeID", nodeID, "key", res.ref.key, "seq", res.ref.seq, "reason", "delivered")
 			_ = r.store.Delete(r.ctx, res.ref.key)
 
 			if !r.trySend(h.recvCh, res.pkt) {
