@@ -69,25 +69,8 @@ if [ -z "$GCS_BUCKET" ]; then
     exit 1
 fi
 
-# ============================================================
-# Check if distributables already exist in GCS
-# ============================================================
-log "Checking if distributables already exist in GCS"
-
 export CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$GCS_CREDENTIALS_FILE"
 GCS_BASE="gs://${GCS_BUCKET}/${GCS_PREFIX}"
-
-# Check for a sentinel file to see if upload was already done.
-SENTINEL="${GCS_BASE}distributables/.uploaded"
-if gcloud storage ls "$SENTINEL" &>/dev/null; then
-    echo "Distributables already uploaded to GCS."
-    echo "To re-upload, delete the sentinel file:"
-    echo "  gcloud storage rm $SENTINEL"
-    echo ""
-    echo "Or delete all distributables:"
-    echo "  gcloud storage rm -r ${GCS_BASE}distributables/"
-    exit 0
-fi
 
 # ============================================================
 # Download distributables locally
@@ -98,17 +81,16 @@ mkdir -p "$BUCKET_DIR"
 "$SCRIPT_DIR/prepare-distributables.sh" "$BUCKET_DIR"
 
 # ============================================================
-# Upload distributables to GCS
+# Upload distributables to GCS (only changed files)
 # ============================================================
-log "Uploading distributables to GCS"
+log "Syncing distributables to GCS"
 
-gcloud storage cp -r "$BUCKET_DIR/distributables" "${GCS_BASE}"
-
-# Create sentinel file to indicate upload is complete.
-echo "Uploaded at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | gcloud storage cp - "$SENTINEL"
+# Use checksums-only because local mtime changes on every download
+# even when content is identical.
+gcloud storage rsync -r -c "$BUCKET_DIR/distributables" "${GCS_BASE}distributables/"
 
 echo ""
-echo "Upload complete: ${GCS_BASE}distributables/"
+echo "Sync complete: ${GCS_BASE}distributables/"
 echo ""
 
 # ============================================================
