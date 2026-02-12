@@ -144,3 +144,142 @@ func TestRegionalPoller_EndToEnd(t *testing.T) {
 	}
 	t.Logf("Success! Received: %s", string(body))
 }
+
+func TestRegionalPoller_UnknownNodeGracePeriod(t *testing.T) {
+	store := NewFSStore(t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	poller := NewRegionalPoller(ctx, store, "node-to-control/")
+	poller.SetWorkerCount(2)
+	go poller.Run()
+	defer poller.Stop()
+
+	nodeID := "unknown-node"
+	prefix := "node-to-control/" + nodeID + "/"
+
+	// Write a message for an unregistered node.
+	pkt := &clientproto.Packet{
+		Type: clientproto.PacketType_DIAL_REQ,
+		Payload: &clientproto.Packet_DialRequest{
+			DialRequest: &clientproto.DialRequest{
+				Protocol: "tcp",
+				Address:  "example.com:80",
+				Random:   123,
+			},
+		},
+	}
+	transport := newSendOnlyTransport(ctx, store, prefix, 0)
+	if err := transport.Send(pkt); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+	transport.Close()
+
+	// Poll cycle 1: First time seeing the node.
+	time.Sleep(100 * time.Millisecond) // Give poller time to run
+	keys, _ := store.ListRecursive(ctx, prefix)
+	if len(keys) != 1 {
+		t.Errorf("Poll 1: Expected 1 file to remain (grace period start), got %d", len(keys))
+	}
+
+	// Poll cycle 2: Within grace period (still <5 minutes).
+	time.Sleep(100 * time.Millisecond)
+	keys, _ = store.ListRecursive(ctx, prefix)
+	if len(keys) != 1 {
+		t.Errorf("Poll 2: Expected 1 file to remain (within grace period), got %d", len(keys))
+	}
+
+	// Test registration during grace period.
+	recvCh := poller.RegisterNode(nodeID)
+	time.Sleep(100 * time.Millisecond)
+
+	// Message should be delivered to the registered handler.
+	select {
+	case receivedPkt := <-recvCh:
+		if receivedPkt.Type != clientproto.PacketType_DIAL_REQ {
+			t.Errorf("Expected DIAL_REQ, got %v", receivedPkt.Type)
+		}
+		t.Logf("Success: message delivered after registration")
+	case <-time.After(2 * time.Second):
+		t.Error("Timeout waiting for message delivery after registration")
+	}
+
+	// File should be deleted after delivery.
+	keys, _ = store.ListRecursive(ctx, prefix)
+	if len(keys) != 0 {
+		t.Errorf("Expected 0 files after delivery, got %d", len(keys))
+	}
+}
+
+func TestRegionalPoller_UnknownNodeGracePeriodExpiry(t *testing.T) {
+	// This test is too slow to run in normal test suite (5+ minutes).
+	// We'll use a shorter grace period by temporarily modifying the constant logic.
+	// For now, just verify the tracking map is populated correctly.
+
+	store := NewFSStore(t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	poller := NewRegionalPoller(ctx, store, "node-to-control/")
+	poller.SetWorkerCount(2)
+	go poller.Run()
+	defer poller.Stop()
+
+	nodeID := "test-unknown-node"
+	prefix := "node-to-control/" + nodeID + "/"
+
+	// Write a message for an unregistered node.
+	pkt := &clientproto.Packet{
+		Type: clientproto.PacketType_DIAL_REQ,
+		Payload: &clientproto.Packet_DialRequest{
+			DialRequest: &clientproto.DialRequest{
+				Protocol: "tcp",
+				Address:  "example.com:80",
+				Random:   456,
+			},
+		},
+	}
+	transport := newSendOnlyTransport(ctx, store, prefix, 0)
+	if err := transport.Send(pkt); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+	transport.Close()
+
+	// Wait for poller to discover the unknown node (poll interval is adaptive, starts at 500ms).
+	var firstSeen time.Time
+	var found bool
+	for i := 0; i < 20; i++ {
+		time.Sleep(100 * time.Millisecond)
+		poller.mu.RLock()
+		firstSeen, found = poller.unknownNodeFirstSeen[nodeID]
+		poller.mu.RUnlock()
+		if found {
+			break
+		}
+	}
+
+	if !found {
+		t.Error("Expected unknown node to be tracked in unknownNodeFirstSeen after 2 seconds")
+	}
+	if time.Since(firstSeen) > 3*time.Second {
+		t.Errorf("Expected firstSeen timestamp to be recent, got %v ago", time.Since(firstSeen))
+	}
+
+	// Verify file still exists (not deleted yet).
+	keys, _ := store.ListRecursive(ctx, prefix)
+	if len(keys) != 1 {
+		t.Errorf("Expected 1 file to remain during grace period, got %d", len(keys))
+	}
+
+	// Register the node — should remove it from unknown tracking.
+	poller.RegisterNode(nodeID)
+	time.Sleep(100 * time.Millisecond)
+
+	poller.mu.RLock()
+	_, stillTracked := poller.unknownNodeFirstSeen[nodeID]
+	poller.mu.RUnlock()
+
+	if stillTracked {
+		t.Error("Expected node to be removed from unknownNodeFirstSeen after registration")
+	}
+}

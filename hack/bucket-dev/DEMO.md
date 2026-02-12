@@ -313,18 +313,10 @@ doesn't come back. Fix:
 kubectl apply -f hack/bucket-dev/manifests/apiserver.yaml
 ```
 
-After server restart, also restart the agent + kubelet on the VM to reset
-sequence counters:
-```bash
-# GCP
-gcloud compute ssh $NODE_ID \
-  --project=$GCP_PROJECT --zone=$GCP_ZONE --tunnel-through-iap \
-  --command='sudo systemctl restart bucket-proxy-agent && sudo systemctl restart kubelet'
-
-# Multipass
-multipass exec $NODE_ID -- sudo systemctl restart bucket-proxy-agent
-multipass exec $NODE_ID -- sudo systemctl restart kubelet
-```
+**Note on agent startup timing**: The RegionalPoller implements a 5-minute grace
+period for messages from unregistered nodes. This means agents can safely start
+before the server discovers them via heartbeat — their early messages won't be
+deleted, and will be processed once the server registers the node.
 
 ## Teardown
 
@@ -372,10 +364,10 @@ Everything else works identically. The only difference: the VM has internet
 access (it's local), so this variant doesn't demonstrate the "zero connectivity"
 aspect as dramatically as the GCP variant with its deny-all-egress firewall.
 
-## Suggested simplifications
+## Architecture notes
 
-1. **Sequence counter reset on reconnect**: The need to manually restart the
-   agent after a server redeploy (to reset sequence counters) is a friction
-   point. The transport layer could negotiate starting sequence numbers on
-   registration, or the server could accept messages starting from any sequence
-   after a fresh registration.
+**Message retention for unregistered nodes**: The RegionalPoller preserves
+messages from unregistered nodes for 5 minutes before deleting them. This grace
+period allows agents to start before server discovery completes (via heartbeat),
+preventing message loss during startup. Once a node registers, any buffered
+messages are processed immediately in sequence order.
