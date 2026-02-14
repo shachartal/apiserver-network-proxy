@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -38,7 +39,14 @@ import (
 
 func TestBucketProxy_EndToEnd(t *testing.T) {
 	// 1. Set up filesystem-backed bucket store.
-	store := NewFSStore(t.TempDir())
+	// Use a manually managed temp dir because background goroutines may still
+	// write files during teardown (e.g., CLOSE_RSP from remoteToProxy defers).
+	storeDir, err := os.MkdirTemp("", "bucket-e2e-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(storeDir) })
+	store := NewFSStore(storeDir)
 
 	// 2. Create ProxyServer with default backend strategy.
 	ps := server.NewProxyServer(

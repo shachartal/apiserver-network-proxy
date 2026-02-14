@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -35,7 +36,14 @@ func TestReverseProxy_EndToEnd(t *testing.T) {
 	t.Cleanup(echoServer.Close)
 
 	// 2. Set up filesystem-backed bucket store.
-	store := NewFSStore(t.TempDir())
+	// Use a manually managed temp dir because background goroutines may still
+	// write files during teardown.
+	storeDir, err := os.MkdirTemp("", "revproxy-e2e-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(storeDir) })
+	store := NewFSStore(storeDir)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -113,7 +121,15 @@ func TestReverseProxy_MultipleConnections(t *testing.T) {
 		}
 	}()
 
-	store := NewFSStore(t.TempDir())
+	// Use a manually managed temp dir because background goroutines may still
+	// write files during teardown (e.g., CLOSE_REQ from localToRemote defers).
+	// os.RemoveAll succeeds regardless, unlike t.TempDir's strict cleanup.
+	storeDir, err := os.MkdirTemp("", "revproxy-multi-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(storeDir) })
+	store := NewFSStore(storeDir)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

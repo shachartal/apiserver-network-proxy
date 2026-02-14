@@ -86,6 +86,9 @@ func makeClosePacket(connectID int64) *client.Packet {
 	}
 }
 
+// testStreamID is a constant streamID used in Nagle tests.
+const testStreamID int64 = 100
+
 func TestNagle_CoalescesSmallDataPackets(t *testing.T) {
 	dir := t.TempDir()
 	store := NewFSStore(dir)
@@ -98,7 +101,7 @@ func TestNagle_CoalescesSmallDataPackets(t *testing.T) {
 
 	// Send three small DATA packets for the same connectID.
 	for i := 0; i < 3; i++ {
-		if err := transport.Send(makeDataPacket(42, []byte("abc"))); err != nil {
+		if err := transport.SendToStream(makeDataPacket(42, []byte("abc")), testStreamID); err != nil {
 			t.Fatalf("Send: %v", err)
 		}
 	}
@@ -139,12 +142,12 @@ func TestNagle_NonDataFlushesBuffer(t *testing.T) {
 	defer transport.Close()
 
 	// Buffer some DATA.
-	if err := transport.Send(makeDataPacket(10, []byte("hello"))); err != nil {
+	if err := transport.SendToStream(makeDataPacket(10, []byte("hello")), testStreamID); err != nil {
 		t.Fatalf("Send DATA: %v", err)
 	}
 
 	// Sending a non-DATA packet should flush buffered DATA first, then send itself.
-	if err := transport.Send(makeClosePacket(10)); err != nil {
+	if err := transport.SendToStream(makeClosePacket(10), testStreamID); err != nil {
 		t.Fatalf("Send CLOSE: %v", err)
 	}
 
@@ -177,7 +180,7 @@ func TestNagle_TimerFlush(t *testing.T) {
 	transport := newSendOnlyTransport(ctx, store, "test/send/", 50*time.Millisecond)
 	defer transport.Close()
 
-	if err := transport.Send(makeDataPacket(7, []byte("timer-test"))); err != nil {
+	if err := transport.SendToStream(makeDataPacket(7, []byte("timer-test")), testStreamID); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -214,7 +217,7 @@ func TestNagle_SizeThresholdFlush(t *testing.T) {
 	for i := range bigPayload {
 		bigPayload[i] = 'X'
 	}
-	if err := transport.Send(makeDataPacket(99, bigPayload)); err != nil {
+	if err := transport.SendToStream(makeDataPacket(99, bigPayload), testStreamID); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -237,14 +240,14 @@ func TestNagle_PerConnectIDIsolation(t *testing.T) {
 	transport := newSendOnlyTransport(ctx, store, "test/send/", 5*time.Second)
 	defer transport.Close()
 
-	// Buffer data for two different connectIDs.
-	if err := transport.Send(makeDataPacket(1, []byte("conn1-a"))); err != nil {
+	// Buffer data for two different connectIDs (same streamID).
+	if err := transport.SendToStream(makeDataPacket(1, []byte("conn1-a")), testStreamID); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if err := transport.Send(makeDataPacket(2, []byte("conn2-a"))); err != nil {
+	if err := transport.SendToStream(makeDataPacket(2, []byte("conn2-a")), testStreamID); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if err := transport.Send(makeDataPacket(1, []byte("conn1-b"))); err != nil {
+	if err := transport.SendToStream(makeDataPacket(1, []byte("conn1-b")), testStreamID); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -286,7 +289,7 @@ func TestNagle_DisabledSendsImmediately(t *testing.T) {
 	transport := newSendOnlyTransport(ctx, store, "test/send/", 0)
 	defer transport.Close()
 
-	if err := transport.Send(makeDataPacket(1, []byte("immediate"))); err != nil {
+	if err := transport.SendToStream(makeDataPacket(1, []byte("immediate")), testStreamID); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -314,19 +317,20 @@ func TestSendImmediate_NoSeqAdvanceOnPutFailure(t *testing.T) {
 
 	// First two sends should fail.
 	for i := 0; i < 2; i++ {
-		if err := transport.Send(makeClosePacket(int64(i))); err == nil {
+		if err := transport.SendToStream(makeClosePacket(int64(i)), testStreamID); err == nil {
 			t.Fatalf("Send %d: expected error, got nil", i)
 		}
 	}
 
 	// Next two sends should succeed.
 	for i := 0; i < 2; i++ {
-		if err := transport.Send(makeClosePacket(int64(i + 10))); err != nil {
+		if err := transport.SendToStream(makeClosePacket(int64(i+10)), testStreamID); err != nil {
 			t.Fatalf("Send %d: %v", i+2, err)
 		}
 	}
 
-	// Verify the stored keys have contiguous sequence numbers 1, 2 (no gaps).
+	// Verify the stored keys have contiguous sequence numbers 1, 2 (no gaps)
+	// and the correct {streamID}-{seqID}.pb format.
 	keys, err := fsStore.List(context.Background(), "test/send/")
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -335,9 +339,12 @@ func TestSendImmediate_NoSeqAdvanceOnPutFailure(t *testing.T) {
 		t.Fatalf("Expected 2 keys, got %d: %v", len(keys), keys)
 	}
 	for i, key := range keys {
-		seq, err := parseSeqFromKey(key)
+		streamID, seq, err := parseStreamAndSeqFromKey(key)
 		if err != nil {
-			t.Fatalf("parseSeqFromKey(%q): %v", key, err)
+			t.Fatalf("parseStreamAndSeqFromKey(%q): %v", key, err)
+		}
+		if streamID != testStreamID {
+			t.Errorf("Key %d: expected streamID %d, got %d", i, testStreamID, streamID)
 		}
 		if seq != uint64(i+1) {
 			t.Errorf("Key %d: expected seq %d, got %d", i, i+1, seq)

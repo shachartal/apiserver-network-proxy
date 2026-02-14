@@ -18,6 +18,7 @@ package bucket
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/metadata"
@@ -35,16 +36,68 @@ import (
 type BucketAgentStream struct {
 	transport *BucketTransport
 	ctx       context.Context
+	mu        sync.RWMutex
+	streamMap map[int64]int64 // connID → random (streamID)
 }
 
 var _ agent.AgentService_ConnectServer = (*BucketAgentStream)(nil)
 
 func (s *BucketAgentStream) Send(pkt *client.Packet) error {
-	return s.transport.Send(pkt)
+	var streamID int64
+	switch pkt.Type {
+	case client.PacketType_DIAL_REQ:
+		if dr := pkt.GetDialRequest(); dr != nil {
+			streamID = dr.Random
+		}
+	case client.PacketType_DIAL_CLS:
+		if dc := pkt.GetCloseDial(); dc != nil {
+			streamID = dc.Random
+		}
+	case client.PacketType_DATA:
+		if d := pkt.GetData(); d != nil {
+			s.mu.RLock()
+			streamID, ok := s.streamMap[d.ConnectID]
+			s.mu.RUnlock()
+			if !ok {
+				klog.V(2).InfoS("BucketAgentStream: DATA for unmapped connID (connection already torn down), skipping send",
+					"connID", d.ConnectID)
+				return nil
+			}
+			return s.transport.SendToStream(pkt, streamID)
+		}
+	case client.PacketType_CLOSE_REQ:
+		if cr := pkt.GetCloseRequest(); cr != nil {
+			s.mu.Lock()
+			streamID, ok := s.streamMap[cr.ConnectID]
+			if ok {
+				delete(s.streamMap, cr.ConnectID)
+			}
+			s.mu.Unlock()
+			if !ok {
+				klog.V(2).InfoS("BucketAgentStream: CLOSE_REQ for unmapped connID (connection already torn down), skipping send",
+					"connID", cr.ConnectID)
+				return nil
+			}
+			return s.transport.SendToStream(pkt, streamID)
+		}
+	}
+	return s.transport.SendToStream(pkt, streamID)
 }
 
 func (s *BucketAgentStream) Recv() (*client.Packet, error) {
-	return s.transport.Recv()
+	pkt, err := s.transport.Recv()
+	if err != nil {
+		return nil, err
+	}
+	// Intercept DIAL_RSP to learn connID → random mapping.
+	if pkt.Type == client.PacketType_DIAL_RSP {
+		if dr := pkt.GetDialResponse(); dr != nil && dr.ConnectID != 0 {
+			s.mu.Lock()
+			s.streamMap[dr.ConnectID] = dr.Random
+			s.mu.Unlock()
+		}
+	}
+	return pkt, nil
 }
 
 func (s *BucketAgentStream) Context() context.Context {
@@ -133,6 +186,7 @@ func connectTransport(ps *server.ProxyServer, transport *BucketTransport, nodeID
 	stream := &BucketAgentStream{
 		transport: transport,
 		ctx:       streamCtx,
+		streamMap: make(map[int64]int64),
 	}
 
 	go func() {

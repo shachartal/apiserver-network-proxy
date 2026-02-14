@@ -67,8 +67,9 @@ type RegionalPoller struct {
 
 // nodeHandler tracks per-node state for dispatching messages.
 type nodeHandler struct {
-	recvSeq uint64
-	recvCh  chan *client.Packet
+	recvSeqs     map[int64]uint64    // streamID → last delivered seq
+	lastActivity map[int64]time.Time // streamID → last activity time (for eviction)
+	recvCh       chan *client.Packet
 }
 
 const (
@@ -111,7 +112,9 @@ func (r *RegionalPoller) RegisterNode(nodeID string) <-chan *client.Packet {
 	defer r.mu.Unlock()
 
 	h := &nodeHandler{
-		recvCh: make(chan *client.Packet, 100),
+		recvSeqs:     make(map[int64]uint64),
+		lastActivity: make(map[int64]time.Time),
+		recvCh:       make(chan *client.Packet, 100),
 	}
 	r.handlers[nodeID] = h
 	// Node is now registered, remove from unknown tracking.
@@ -171,9 +174,10 @@ func (r *RegionalPoller) closeAll() {
 
 // messageRef holds a discovered message's metadata for download.
 type messageRef struct {
-	nodeID string
-	key    string
-	seq    uint64
+	nodeID   string
+	key      string
+	streamID int64
+	seq      uint64
 }
 
 func (r *RegionalPoller) pollOnce() bool {
@@ -215,23 +219,23 @@ func (r *RegionalPoller) pollOnce() bool {
 			continue
 		}
 
-		seq, err := parseSeqFromKey(key)
+		streamID, seq, err := parseStreamAndSeqFromKey(key)
 		if err != nil {
 			continue
 		}
 
 		// Check if we have a handler for this node.
 		h, ok := r.handlers[nodeID]
-		if ok && seq <= h.recvSeq {
+		if ok && seq <= h.recvSeqs[streamID] {
 			// Already processed; delete duplicate.
-			klog.V(4).InfoS("Deleting duplicate message", "nodeID", nodeID, "key", key, "seq", seq, "currentSeq", h.recvSeq)
+			klog.V(4).InfoS("Deleting duplicate message", "nodeID", nodeID, "key", key, "streamID", streamID, "seq", seq, "currentSeq", h.recvSeqs[streamID])
 			_ = r.store.Delete(r.ctx, key)
 			continue
 		}
 
 		// Add ref for both registered and unregistered nodes.
 		// Unregistered nodes will be handled with grace period in downloadAndDispatch.
-		refs = append(refs, messageRef{nodeID: nodeID, key: key, seq: seq})
+		refs = append(refs, messageRef{nodeID: nodeID, key: key, streamID: streamID, seq: seq})
 	}
 	r.mu.RUnlock()
 
@@ -272,6 +276,10 @@ func parseNodeAndFile(prefix, key string) (nodeID, filename string) {
 func isHeartbeatFile(filename string) bool {
 	return strings.HasSuffix(filename, heartbeatSuffix)
 }
+
+// staleStreamTimeout is how long a stream entry is kept after its last activity
+// before being evicted from the recvSeqs/lastActivity maps.
+const staleStreamTimeout = 5 * time.Minute
 
 func (r *RegionalPoller) downloadAndDispatch(refs []messageRef) {
 	type result struct {
@@ -327,45 +335,59 @@ func (r *RegionalPoller) downloadAndDispatch(refs []messageRef) {
 		close(results)
 	}()
 
-	// Collect all results, then sort by sequence number to guarantee in-order
-	// delivery. The worker pool downloads in parallel, so results arrive in
-	// arbitrary order — but TLS and other stream protocols require strict ordering.
+	// Collect all results, then sort by (nodeID, streamID, seq) to guarantee
+	// in-order delivery. The worker pool downloads in parallel, so results
+	// arrive in arbitrary order — but TLS and other stream protocols require
+	// strict ordering within each stream.
 	var collected []result
 	for res := range results {
 		collected = append(collected, res)
 	}
 	sort.Slice(collected, func(i, j int) bool {
-		return collected[i].ref.seq < collected[j].ref.seq
+		ri, rj := collected[i].ref, collected[j].ref
+		if ri.nodeID != rj.nodeID {
+			return ri.nodeID < rj.nodeID
+		}
+		if ri.streamID != rj.streamID {
+			return ri.streamID < rj.streamID
+		}
+		return ri.seq < rj.seq
 	})
 
-	// Group by nodeID so we can check contiguity per-node.
-	byNode := make(map[string][]result)
+	// Group by (nodeID, streamID) so we can check contiguity per-stream.
+	type nodeStreamKey struct {
+		nodeID   string
+		streamID int64
+	}
+	byNodeStream := make(map[nodeStreamKey][]result)
 	for _, res := range collected {
-		byNode[res.ref.nodeID] = append(byNode[res.ref.nodeID], res)
+		k := nodeStreamKey{nodeID: res.ref.nodeID, streamID: res.ref.streamID}
+		byNodeStream[k] = append(byNodeStream[k], res)
 	}
 
-	// Dispatch only the contiguous prefix for each node. If there is a gap
-	// (e.g., seq 1,3 with 2 missing), deliver only up to the gap. Messages
-	// beyond the gap are left in the bucket for the next poll cycle.
-	// This prevents out-of-order delivery that would corrupt TLS streams.
-	for nodeID, nodeResults := range byNode {
+	// Dispatch only the contiguous prefix for each (nodeID, stream). If there
+	// is a gap (e.g., seq 1,3 with 2 missing), deliver only up to the gap.
+	// Messages beyond the gap are left in the bucket for the next poll cycle.
+	// Gaps in one stream do not affect other streams on the same node.
+	now := time.Now()
+	for nsk, streamResults := range byNodeStream {
 		r.mu.RLock()
-		h, ok := r.handlers[nodeID]
+		h, ok := r.handlers[nsk.nodeID]
 		r.mu.RUnlock()
 
 		if !ok {
 			// Node not registered. Check if grace period has elapsed before deleting.
 			r.mu.Lock()
-			firstSeen, known := r.unknownNodeFirstSeen[nodeID]
+			firstSeen, known := r.unknownNodeFirstSeen[nsk.nodeID]
 			if !known {
 				// First time seeing files for this unknown node — record timestamp.
-				r.unknownNodeFirstSeen[nodeID] = time.Now()
+				r.unknownNodeFirstSeen[nsk.nodeID] = time.Now()
 				r.mu.Unlock()
 				klog.V(3).InfoS("RegionalPoller: found files for unregistered node, starting grace period",
-					"nodeID", nodeID, "fileCount", len(nodeResults), "gracePeriod", unknownNodeGracePeriod)
-				for _, res := range nodeResults {
+					"nodeID", nsk.nodeID, "fileCount", len(streamResults), "gracePeriod", unknownNodeGracePeriod)
+				for _, res := range streamResults {
 					klog.V(4).InfoS("Preserving file for unregistered node (grace period start)",
-						"nodeID", nodeID, "key", res.ref.key, "seq", res.ref.seq)
+						"nodeID", nsk.nodeID, "key", res.ref.key, "seq", res.ref.seq)
 				}
 				continue
 			}
@@ -376,63 +398,92 @@ func (r *RegionalPoller) downloadAndDispatch(refs []messageRef) {
 			if age < unknownNodeGracePeriod {
 				// Still within grace period — keep messages for next poll.
 				klog.V(4).InfoS("RegionalPoller: preserving files for unregistered node within grace period",
-					"nodeID", nodeID, "fileCount", len(nodeResults), "age", age, "gracePeriod", unknownNodeGracePeriod)
-				for _, res := range nodeResults {
+					"nodeID", nsk.nodeID, "fileCount", len(streamResults), "age", age, "gracePeriod", unknownNodeGracePeriod)
+				for _, res := range streamResults {
 					klog.V(5).InfoS("Preserving file within grace period",
-						"nodeID", nodeID, "key", res.ref.key, "seq", res.ref.seq, "age", age)
+						"nodeID", nsk.nodeID, "key", res.ref.key, "seq", res.ref.seq, "age", age)
 				}
 				continue
 			}
 
-			// Grace period elapsed — delete stale messages.
+			// Grace period elapsed — delete stale messages and register file.
 			klog.V(2).InfoS("RegionalPoller: deleting stale files for unregistered node after grace period",
-				"nodeID", nodeID, "age", age, "fileCount", len(nodeResults))
+				"nodeID", nsk.nodeID, "age", age, "fileCount", len(streamResults))
 			r.mu.Lock()
-			delete(r.unknownNodeFirstSeen, nodeID)
+			delete(r.unknownNodeFirstSeen, nsk.nodeID)
 			r.mu.Unlock()
-			for _, res := range nodeResults {
+			for _, res := range streamResults {
 				klog.V(3).InfoS("Deleting expired file for unregistered node",
-					"nodeID", nodeID, "key", res.ref.key, "seq", res.ref.seq, "age", age, "reason", "grace-period-expired")
+					"nodeID", nsk.nodeID, "key", res.ref.key, "seq", res.ref.seq, "age", age, "reason", "grace-period-expired")
 				_ = r.store.Delete(r.ctx, res.ref.key)
 			}
+			// Also delete the register marker file, which is skipped during message
+			// parsing and would otherwise persist forever for ungracefully killed agents.
+			regKey := r.prefix + nsk.nodeID + "/" + registrationFile
+			_ = r.store.Delete(r.ctx, regKey)
 			continue
 		}
 
 		r.mu.RLock()
-		expectedSeq := h.recvSeq + 1
+		expectedSeq := h.recvSeqs[nsk.streamID] + 1
 		r.mu.RUnlock()
 
-		for _, res := range nodeResults {
+		for i, res := range streamResults {
 			if res.ref.seq != expectedSeq {
-				// Gap detected — stop delivering for this node.
-				// Remaining messages stay in the bucket for next poll.
-				klog.V(4).InfoS("RegionalPoller gap detected, deferring remaining messages",
-					"nodeID", nodeID, "expected", expectedSeq, "got", res.ref.seq)
-				// Log which files are being deferred (not deleted).
-				for _, deferred := range nodeResults {
-					if deferred.ref.seq >= res.ref.seq {
-						klog.V(5).InfoS("Deferring file due to gap",
-							"nodeID", nodeID, "key", deferred.ref.key, "seq", deferred.ref.seq, "reason", "sequence-gap")
+				// Gap detected. If expectedSeq == 1 (no prior record of this stream)
+				// and the first file has seq > 1, the files are permanently orphaned —
+				// a previous stream used this ID, its state was cleaned up on CLOSE,
+				// but late-arriving files remained. Delete them instead of deferring forever.
+				if expectedSeq == 1 && i == 0 {
+					klog.V(2).InfoS("RegionalPoller: deleting orphaned files for unknown stream (seq reset)",
+						"nodeID", nsk.nodeID, "streamID", nsk.streamID, "firstSeq", res.ref.seq, "fileCount", len(streamResults))
+					for _, orphan := range streamResults {
+						_ = r.store.Delete(r.ctx, orphan.ref.key)
 					}
+				} else {
+					klog.V(4).InfoS("RegionalPoller gap detected, deferring remaining messages",
+						"nodeID", nsk.nodeID, "streamID", nsk.streamID, "expected", expectedSeq, "got", res.ref.seq)
 				}
 				break
 			}
 
 			r.mu.Lock()
-			h.recvSeq = res.ref.seq
+			h.recvSeqs[nsk.streamID] = res.ref.seq
+			h.lastActivity[nsk.streamID] = now
 			r.mu.Unlock()
 
 			klog.V(5).InfoS("Deleting message after delivery",
-				"nodeID", nodeID, "key", res.ref.key, "seq", res.ref.seq, "reason", "delivered")
+				"nodeID", nsk.nodeID, "key", res.ref.key, "streamID", nsk.streamID, "seq", res.ref.seq, "reason", "delivered")
 			_ = r.store.Delete(r.ctx, res.ref.key)
 
 			if !r.trySend(h.recvCh, res.pkt) {
 				// Channel was closed (node unregistered) or context cancelled.
 				return
 			}
+
+			// Clean up stream state after CLOSE packets.
+			if isClosePacket(res.pkt) {
+				r.mu.Lock()
+				delete(h.recvSeqs, nsk.streamID)
+				delete(h.lastActivity, nsk.streamID)
+				r.mu.Unlock()
+			}
+
 			expectedSeq++
 		}
 	}
+
+	// Evict stale stream entries across all handlers.
+	r.mu.Lock()
+	for _, h := range r.handlers {
+		for sid, last := range h.lastActivity {
+			if now.Sub(last) > staleStreamTimeout {
+				delete(h.recvSeqs, sid)
+				delete(h.lastActivity, sid)
+			}
+		}
+	}
+	r.mu.Unlock()
 }
 
 // trySend attempts to send a packet on the channel, recovering from a panic
@@ -450,6 +501,12 @@ func (r *RegionalPoller) trySend(ch chan<- *client.Packet, pkt *client.Packet) (
 	case <-r.ctx.Done():
 		return false
 	}
+}
+
+// isClosePacket returns true if the packet is a CLOSE_RSP or CLOSE_REQ,
+// indicating the stream is finished and its state can be cleaned up.
+func isClosePacket(pkt *client.Packet) bool {
+	return pkt.Type == client.PacketType_CLOSE_RSP || pkt.Type == client.PacketType_CLOSE_REQ
 }
 
 // adaptiveInterval computes the next poll interval based on activity.

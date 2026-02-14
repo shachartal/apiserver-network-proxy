@@ -72,8 +72,9 @@ type BucketAgent struct {
 	store      Store
 	nextConnID atomic.Int64
 
-	mu    sync.RWMutex
-	conns map[int64]*endpointConn
+	mu        sync.RWMutex
+	conns     map[int64]*endpointConn
+	streamMap map[int64]int64 // connID → random (streamID)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -95,6 +96,7 @@ func NewBucketAgent(ctx context.Context, store Store, nodeID string, nagleDelay 
 		nodeID:    nodeID,
 		store:     store,
 		conns:     make(map[int64]*endpointConn),
+		streamMap: make(map[int64]int64),
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -156,14 +158,15 @@ func (a *BucketAgent) handleDialReq(pkt *client.Packet) {
 		return
 	}
 
+	random := dialReq.Random
 	connID := a.nextConnID.Add(1)
-	klog.V(3).InfoS("BucketAgent DIAL_REQ", "dialID", dialReq.Random, "address", dialReq.Address, "connID", connID)
+	klog.V(3).InfoS("BucketAgent DIAL_REQ", "dialID", random, "address", dialReq.Address, "connID", connID)
 
 	dialResp := &client.Packet{
 		Type: client.PacketType_DIAL_RSP,
 		Payload: &client.Packet_DialResponse{
 			DialResponse: &client.DialResponse{
-				Random: dialReq.Random,
+				Random: random,
 			},
 		},
 	}
@@ -172,7 +175,7 @@ func (a *BucketAgent) handleDialReq(pkt *client.Packet) {
 	if err != nil {
 		klog.V(1).InfoS("BucketAgent dial failed", "address", dialReq.Address, "err", err)
 		dialResp.GetDialResponse().Error = err.Error()
-		if sendErr := a.transport.Send(dialResp); sendErr != nil {
+		if sendErr := a.transport.SendToStream(dialResp, random); sendErr != nil {
 			klog.ErrorS(sendErr, "Failed to send DIAL_RSP error")
 		}
 		return
@@ -185,19 +188,21 @@ func (a *BucketAgent) handleDialReq(pkt *client.Packet) {
 
 	a.mu.Lock()
 	a.conns[connID] = eConn
+	a.streamMap[connID] = random
 	a.mu.Unlock()
 
 	dialResp.GetDialResponse().ConnectID = connID
-	if err := a.transport.Send(dialResp); err != nil {
+	if err := a.transport.SendToStream(dialResp, random); err != nil {
 		klog.ErrorS(err, "Failed to send DIAL_RSP", "connID", connID)
 		eConn.close()
 		a.mu.Lock()
 		delete(a.conns, connID)
+		delete(a.streamMap, connID)
 		a.mu.Unlock()
 		return
 	}
 
-	go a.remoteToProxy(connID, eConn)
+	go a.remoteToProxy(connID, random, eConn)
 	go a.proxyToRemote(connID, eConn)
 }
 
@@ -213,16 +218,7 @@ func (a *BucketAgent) handleData(pkt *client.Packet) {
 	a.mu.RUnlock()
 
 	if !ok {
-		klog.V(2).InfoS("DATA for unknown connection", "connID", data.ConnectID)
-		_ = a.transport.Send(&client.Packet{
-			Type: client.PacketType_CLOSE_RSP,
-			Payload: &client.Packet_CloseResponse{
-				CloseResponse: &client.CloseResponse{
-					ConnectID: data.ConnectID,
-					Error:     "unrecognized connectID",
-				},
-			},
-		})
+		klog.V(2).InfoS("DATA for unknown connection (already closed)", "connID", data.ConnectID)
 		return
 	}
 	eConn.send(data.Data)
@@ -238,27 +234,32 @@ func (a *BucketAgent) handleCloseReq(pkt *client.Packet) {
 
 	a.mu.Lock()
 	eConn, ok := a.conns[connID]
+	random := a.streamMap[connID]
 	if ok {
 		delete(a.conns, connID)
+		delete(a.streamMap, connID)
 	}
 	a.mu.Unlock()
 
-	if ok {
-		eConn.close()
+	if !ok {
+		klog.V(2).InfoS("CLOSE_REQ for unknown connection (already closed)", "connID", connID)
+		return
 	}
 
-	_ = a.transport.Send(&client.Packet{
+	eConn.close()
+
+	_ = a.transport.SendToStream(&client.Packet{
 		Type: client.PacketType_CLOSE_RSP,
 		Payload: &client.Packet_CloseResponse{
 			CloseResponse: &client.CloseResponse{
 				ConnectID: connID,
 			},
 		},
-	})
+	}, random)
 }
 
 // remoteToProxy reads from the endpoint and sends DATA packets back through the bucket.
-func (a *BucketAgent) remoteToProxy(connID int64, eConn *endpointConn) {
+func (a *BucketAgent) remoteToProxy(connID, random int64, eConn *endpointConn) {
 	defer func() {
 		klog.V(4).InfoS("remoteToProxy exiting", "connID", connID)
 		// Send CLOSE_RSP when remote closes
@@ -266,20 +267,21 @@ func (a *BucketAgent) remoteToProxy(connID int64, eConn *endpointConn) {
 		_, stillTracked := a.conns[connID]
 		if stillTracked {
 			delete(a.conns, connID)
+			delete(a.streamMap, connID)
 		}
 		a.mu.Unlock()
 
 		eConn.close()
 
 		if stillTracked {
-			_ = a.transport.Send(&client.Packet{
+			_ = a.transport.SendToStream(&client.Packet{
 				Type: client.PacketType_CLOSE_RSP,
 				Payload: &client.Packet_CloseResponse{
 					CloseResponse: &client.CloseResponse{
 						ConnectID: connID,
 					},
 				},
-			})
+			}, random)
 		}
 	}()
 
@@ -290,7 +292,7 @@ func (a *BucketAgent) remoteToProxy(connID int64, eConn *endpointConn) {
 			// Copy the data since buf will be reused.
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			if sendErr := a.transport.Send(&client.Packet{
+			if sendErr := a.transport.SendToStream(&client.Packet{
 				Type: client.PacketType_DATA,
 				Payload: &client.Packet_Data{
 					Data: &client.Data{
@@ -298,7 +300,7 @@ func (a *BucketAgent) remoteToProxy(connID int64, eConn *endpointConn) {
 						ConnectID: connID,
 					},
 				},
-			}); sendErr != nil {
+			}, random); sendErr != nil {
 				klog.ErrorS(sendErr, "Failed to send DATA", "connID", connID)
 				return
 			}

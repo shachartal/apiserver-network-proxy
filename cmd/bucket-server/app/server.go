@@ -102,7 +102,7 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	if err != nil {
 		return fmt.Errorf("failed to parse proxy strategies: %v", err)
 	}
-	p.proxyServer = server.NewProxyServer(o.ServerID, ps, 1, &server.AgentTokenAuthenticationOptions{}, 10)
+	p.proxyServer = server.NewProxyServer(o.ServerID, ps, 1, &server.AgentTokenAuthenticationOptions{}, 50)
 
 	// Start frontend gRPC server on UDS.
 	if err := p.runFrontendServer(ctx, o); err != nil {

@@ -41,8 +41,8 @@ type AgentPoller struct {
 
 	fwdTransport *BucketTransport
 	revTransport *BucketTransport
-	fwdRecvSeq   uint64
-	revRecvSeq   uint64
+	fwdRecvSeqs  map[int64]uint64 // streamID → last delivered seq
+	revRecvSeqs  map[int64]uint64 // streamID → last delivered seq
 
 	adaptive     bool
 	pollInterval time.Duration
@@ -67,6 +67,8 @@ func NewAgentPoller(ctx context.Context, store Store, nodeID string, fwdTranspor
 		prefix:       "control-to-node/" + nodeID + "/",
 		fwdTransport: fwdTransport,
 		revTransport: revTransport,
+		fwdRecvSeqs:  make(map[int64]uint64),
+		revRecvSeqs:  make(map[int64]uint64),
 		adaptive:     adaptive,
 		pollInterval: pollInterval,
 		ctx:          ctx,
@@ -114,6 +116,16 @@ func (p *AgentPoller) closeChannels() {
 	}
 }
 
+// agentRef holds a discovered message's metadata for dispatching.
+type agentRef struct {
+	key       string
+	streamID  int64
+	seq       uint64
+	channel   string // "fwd" or "rev"
+	transport *BucketTransport
+	recvSeqs  map[int64]uint64
+}
+
 // pollOnce does one ListRecursive and dispatches messages to transports.
 // Returns true if any new messages were found and processed.
 func (p *AgentPoller) pollOnce() bool {
@@ -129,67 +141,118 @@ func (p *AgentPoller) pollOnce() bool {
 	// Sort to process each channel's messages in sequence order.
 	sort.Strings(keys)
 
-	found := false
+	// Parse and categorize all keys.
+	type chanStreamKey struct {
+		channel  string
+		streamID int64
+	}
+	groups := make(map[chanStreamKey][]agentRef)
+
 	for _, key := range keys {
 		// Parse the relative path after the prefix to determine channel.
-		// e.g. "control-to-node/node-1/fwd/00001.pb" → relPath = "fwd/00001.pb"
 		relPath := strings.TrimPrefix(key, p.prefix)
 
 		var transport *BucketTransport
-		var recvSeq *uint64
+		var recvSeqs map[int64]uint64
+		var channel string
 		switch {
 		case strings.HasPrefix(relPath, "fwd/"):
 			if p.fwdTransport == nil {
 				continue
 			}
 			transport = p.fwdTransport
-			recvSeq = &p.fwdRecvSeq
+			recvSeqs = p.fwdRecvSeqs
+			channel = "fwd"
 		case strings.HasPrefix(relPath, "rev/"):
 			if p.revTransport == nil {
 				continue
 			}
 			transport = p.revTransport
-			recvSeq = &p.revRecvSeq
+			recvSeqs = p.revRecvSeqs
+			channel = "rev"
 		default:
-			// Unknown subdirectory, skip.
 			continue
 		}
 
-		seq, err := parseSeqFromKey(key)
+		streamID, seq, err := parseStreamAndSeqFromKey(key)
 		if err != nil {
 			continue
 		}
 
-		if seq <= *recvSeq {
+		if seq <= recvSeqs[streamID] {
 			// Already processed; delete it.
 			_ = p.store.Delete(p.ctx, key)
 			continue
 		}
 
-		data, err := p.store.Get(p.ctx, key)
-		if err != nil {
-			if p.ctx.Err() != nil {
+		csk := chanStreamKey{channel: channel, streamID: streamID}
+		groups[csk] = append(groups[csk], agentRef{
+			key:       key,
+			streamID:  streamID,
+			seq:       seq,
+			channel:   channel,
+			transport: transport,
+			recvSeqs:  recvSeqs,
+		})
+	}
+
+	found := false
+	for _, refs := range groups {
+		if len(refs) == 0 {
+			continue
+		}
+		transport := refs[0].transport
+		recvSeqs := refs[0].recvSeqs
+		streamID := refs[0].streamID
+		expectedSeq := recvSeqs[streamID] + 1
+
+		for i, ref := range refs {
+			if ref.seq != expectedSeq {
+				// Gap detected. If expectedSeq == 1 (no prior record of this stream)
+				// and the first file has seq > 1, the files are permanently orphaned.
+				// Delete them instead of deferring forever.
+				if expectedSeq == 1 && i == 0 {
+					klog.V(2).InfoS("AgentPoller: deleting orphaned files for unknown stream (seq reset)",
+						"streamID", streamID, "firstSeq", ref.seq, "fileCount", len(refs))
+					for _, orphan := range refs {
+						_ = p.store.Delete(p.ctx, orphan.key)
+					}
+				}
+				break
+			}
+
+			data, err := p.store.Get(p.ctx, ref.key)
+			if err != nil {
+				if p.ctx.Err() != nil {
+					return found
+				}
+				klog.V(4).InfoS("AgentPoller get error", "key", ref.key, "err", err)
+				break // Gap in downloadable data — wait for retry.
+			}
+
+			pkt := &client.Packet{}
+			if err := proto.Unmarshal(data, pkt); err != nil {
+				klog.ErrorS(err, "AgentPoller unmarshal error", "key", ref.key)
+				_ = p.store.Delete(p.ctx, ref.key)
+				break
+			}
+
+			recvSeqs[streamID] = ref.seq
+			found = true
+			_ = p.store.Delete(p.ctx, ref.key)
+
+			select {
+			case transport.recvCh <- pkt:
+			case <-p.ctx.Done():
 				return found
 			}
-			klog.V(4).InfoS("AgentPoller get error", "key", key, "err", err)
-			continue
-		}
 
-		pkt := &client.Packet{}
-		if err := proto.Unmarshal(data, pkt); err != nil {
-			klog.ErrorS(err, "AgentPoller unmarshal error", "key", key)
-			_ = p.store.Delete(p.ctx, key)
-			continue
-		}
+			// Clean up stream state after CLOSE packets.
+			if isClosePacket(pkt) {
+				delete(recvSeqs, streamID)
+			}
 
-		*recvSeq = seq
-		found = true
-		_ = p.store.Delete(p.ctx, key)
-
-		select {
-		case transport.recvCh <- pkt:
-		case <-p.ctx.Done():
-			return found
+			expectedSeq++
 		}
 	}
 	return found
