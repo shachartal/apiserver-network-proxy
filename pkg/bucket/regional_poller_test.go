@@ -38,7 +38,14 @@ import (
 )
 
 func TestRegionalPoller_EndToEnd(t *testing.T) {
-	store := NewFSStore(t.TempDir())
+	// Use a manually managed temp dir because background goroutines may still
+	// write files during teardown.
+	storeDir, err := os.MkdirTemp("", "regional-e2e-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(storeDir) })
+	store := NewFSStore(storeDir)
 
 	// Create ProxyServer.
 	ps := server.NewProxyServer(
@@ -170,7 +177,7 @@ func TestRegionalPoller_UnknownNodeGracePeriod(t *testing.T) {
 		},
 	}
 	transport := newSendOnlyTransport(ctx, store, prefix, 0)
-	if err := transport.Send(pkt); err != nil {
+	if err := transport.SendToStream(pkt, 123); err != nil {
 		t.Fatalf("Failed to write message: %v", err)
 	}
 	transport.Close()
@@ -240,7 +247,7 @@ func TestRegionalPoller_UnknownNodeGracePeriodExpiry(t *testing.T) {
 		},
 	}
 	transport := newSendOnlyTransport(ctx, store, prefix, 0)
-	if err := transport.Send(pkt); err != nil {
+	if err := transport.SendToStream(pkt, 456); err != nil {
 		t.Fatalf("Failed to write message: %v", err)
 	}
 	transport.Close()

@@ -42,8 +42,9 @@ type ReverseProxyHandler struct {
 	nodeID     string
 	nextConnID atomic.Int64
 
-	mu    sync.RWMutex
-	conns map[int64]*endpointConn
+	mu        sync.RWMutex
+	conns     map[int64]*endpointConn
+	streamMap map[int64]int64 // connID → random (streamID)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -66,6 +67,7 @@ func NewReverseProxyHandler(ctx context.Context, store Store, nodeID, targetAddr
 		targetAddr: targetAddr,
 		nodeID:     nodeID,
 		conns:      make(map[int64]*endpointConn),
+		streamMap:  make(map[int64]int64),
 		ctx:        ctx,
 		cancel:     cancel,
 	}
@@ -94,6 +96,7 @@ func NewReverseProxyHandlerWithPoller(ctx context.Context, store Store, nodeID, 
 		targetAddr: targetAddr,
 		nodeID:     nodeID,
 		conns:      make(map[int64]*endpointConn),
+		streamMap:  make(map[int64]int64),
 		ctx:        ctx,
 		cancel:     cancel,
 	}
@@ -145,14 +148,15 @@ func (h *ReverseProxyHandler) handleDialReq(pkt *client.Packet) {
 		return
 	}
 
+	random := dialReq.Random
 	connID := h.nextConnID.Add(1)
-	klog.V(3).InfoS("ReverseProxyHandler DIAL_REQ", "dialID", dialReq.Random, "requestedAddr", dialReq.Address, "targetAddr", h.targetAddr, "connID", connID)
+	klog.V(3).InfoS("ReverseProxyHandler DIAL_REQ", "dialID", random, "requestedAddr", dialReq.Address, "targetAddr", h.targetAddr, "connID", connID)
 
 	dialResp := &client.Packet{
 		Type: client.PacketType_DIAL_RSP,
 		Payload: &client.Packet_DialResponse{
 			DialResponse: &client.DialResponse{
-				Random: dialReq.Random,
+				Random: random,
 			},
 		},
 	}
@@ -162,7 +166,7 @@ func (h *ReverseProxyHandler) handleDialReq(pkt *client.Packet) {
 	if err != nil {
 		klog.V(1).InfoS("ReverseProxyHandler dial failed", "targetAddr", h.targetAddr, "err", err)
 		dialResp.GetDialResponse().Error = err.Error()
-		if sendErr := h.transport.Send(dialResp); sendErr != nil {
+		if sendErr := h.transport.SendToStream(dialResp, random); sendErr != nil {
 			klog.ErrorS(sendErr, "Failed to send DIAL_RSP error")
 		}
 		return
@@ -175,19 +179,21 @@ func (h *ReverseProxyHandler) handleDialReq(pkt *client.Packet) {
 
 	h.mu.Lock()
 	h.conns[connID] = eConn
+	h.streamMap[connID] = random
 	h.mu.Unlock()
 
 	dialResp.GetDialResponse().ConnectID = connID
-	if err := h.transport.Send(dialResp); err != nil {
+	if err := h.transport.SendToStream(dialResp, random); err != nil {
 		klog.ErrorS(err, "Failed to send DIAL_RSP", "connID", connID)
 		eConn.close()
 		h.mu.Lock()
 		delete(h.conns, connID)
+		delete(h.streamMap, connID)
 		h.mu.Unlock()
 		return
 	}
 
-	go h.remoteToProxy(connID, eConn)
+	go h.remoteToProxy(connID, random, eConn)
 	go h.proxyToRemote(connID, eConn)
 }
 
@@ -203,16 +209,7 @@ func (h *ReverseProxyHandler) handleData(pkt *client.Packet) {
 	h.mu.RUnlock()
 
 	if !ok {
-		klog.V(2).InfoS("DATA for unknown connection", "connID", data.ConnectID)
-		_ = h.transport.Send(&client.Packet{
-			Type: client.PacketType_CLOSE_RSP,
-			Payload: &client.Packet_CloseResponse{
-				CloseResponse: &client.CloseResponse{
-					ConnectID: data.ConnectID,
-					Error:     "unrecognized connectID",
-				},
-			},
-		})
+		klog.V(2).InfoS("DATA for unknown connection (already closed)", "connID", data.ConnectID)
 		return
 	}
 	eConn.send(data.Data)
@@ -228,47 +225,53 @@ func (h *ReverseProxyHandler) handleCloseReq(pkt *client.Packet) {
 
 	h.mu.Lock()
 	eConn, ok := h.conns[connID]
+	random := h.streamMap[connID]
 	if ok {
 		delete(h.conns, connID)
+		delete(h.streamMap, connID)
 	}
 	h.mu.Unlock()
 
-	if ok {
-		eConn.close()
+	if !ok {
+		klog.V(2).InfoS("CLOSE_REQ for unknown connection (already closed)", "connID", connID)
+		return
 	}
 
-	_ = h.transport.Send(&client.Packet{
+	eConn.close()
+
+	_ = h.transport.SendToStream(&client.Packet{
 		Type: client.PacketType_CLOSE_RSP,
 		Payload: &client.Packet_CloseResponse{
 			CloseResponse: &client.CloseResponse{
 				ConnectID: connID,
 			},
 		},
-	})
+	}, random)
 }
 
 // remoteToProxy reads from the target endpoint and sends DATA packets back through the bucket.
-func (h *ReverseProxyHandler) remoteToProxy(connID int64, eConn *endpointConn) {
+func (h *ReverseProxyHandler) remoteToProxy(connID, random int64, eConn *endpointConn) {
 	defer func() {
 		klog.V(4).InfoS("ReverseProxyHandler remoteToProxy exiting", "connID", connID)
 		h.mu.Lock()
 		_, stillTracked := h.conns[connID]
 		if stillTracked {
 			delete(h.conns, connID)
+			delete(h.streamMap, connID)
 		}
 		h.mu.Unlock()
 
 		eConn.close()
 
 		if stillTracked {
-			_ = h.transport.Send(&client.Packet{
+			_ = h.transport.SendToStream(&client.Packet{
 				Type: client.PacketType_CLOSE_RSP,
 				Payload: &client.Packet_CloseResponse{
 					CloseResponse: &client.CloseResponse{
 						ConnectID: connID,
 					},
 				},
-			})
+			}, random)
 		}
 	}()
 
@@ -278,7 +281,7 @@ func (h *ReverseProxyHandler) remoteToProxy(connID int64, eConn *endpointConn) {
 		if n > 0 {
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			if sendErr := h.transport.Send(&client.Packet{
+			if sendErr := h.transport.SendToStream(&client.Packet{
 				Type: client.PacketType_DATA,
 				Payload: &client.Packet_Data{
 					Data: &client.Data{
@@ -286,7 +289,7 @@ func (h *ReverseProxyHandler) remoteToProxy(connID int64, eConn *endpointConn) {
 						ConnectID: connID,
 					},
 				},
-			}); sendErr != nil {
+			}, random); sendErr != nil {
 				klog.ErrorS(sendErr, "Failed to send DATA", "connID", connID)
 				return
 			}

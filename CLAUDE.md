@@ -70,21 +70,26 @@ kube-apiserver → [gRPC UDS] → proxy-server → [gRPC mTLS OR bucket store] �
 
 ### Bucket Transport (`pkg/bucket/`)
 
-Replaces gRPC between server and agent with object storage. Messages are protobuf-encoded `.pb` files stored at structured key paths:
+Replaces gRPC between server and agent with object storage. Messages are protobuf-encoded `.pb` files stored at structured key paths using per-stream sequencing:
 
-- `control-to-node/{nodeID}/msg-{seq}.pb` — server → agent
-- `node-to-control/{nodeID}/msg-{seq}.pb` — agent → server
+- `control-to-node/{nodeID}/fwd/{streamID}-{seq}.pb` — server → agent (forward proxy)
+- `control-to-node/{nodeID}/rev/{streamID}-{seq}.pb` — server → agent (reverse proxy)
+- `node-to-control/{nodeID}/{streamID}-{seq}.pb` — agent → server
 - `node-to-control/{nodeID}/heartbeat-{seq}.hb` — agent liveness
-- `node-to-control-reverse/{nodeID}/` — reverse tunnel (kubelet→apiserver)
+- `node-to-control-reverse/{nodeID}/{streamID}-{seq}.pb` — reverse tunnel (kubelet→apiserver)
+
+The `{streamID}` is the DIAL correlation value (`Random` field) that identifies a Konnectivity stream. Each stream has its own independent sequence counter, so a failed GCS Put only blocks the affected stream, not all streams on the node.
 
 Key components:
-- **`BucketTransport`** (`transport.go`) — Send/Recv semantics over a Store, with Nagle buffering for small packets
+- **`BucketTransport`** (`transport.go`) — `SendToStream(pkt, streamID)` semantics over a Store, with per-stream sequence counters and Nagle buffering for small packets
 - **`Store` interface** (`store.go`) — Put/Get/List/ListRecursive/Delete. Implementations: `GCSStore` (production), `FSStore` (testing), `RetryStore` (wrapper), `MetricsStore` (Prometheus instrumentation)
-- **`RegionalPoller`** (`regional_poller.go`) — Single `ListRecursive` call polls messages for ALL nodes, dispatches to per-node channels. Adaptive interval (500ms–10s). Implements 5-minute grace period for unregistered nodes before deleting their messages, allowing agents to start before server discovery completes.
+- **`RegionalPoller`** (`regional_poller.go`) — Single `ListRecursive` call polls messages for ALL nodes, dispatches to per-node channels with per-stream contiguity enforcement. Adaptive interval (500ms–10s). Implements 5-minute grace period for unregistered nodes and stale stream eviction.
 - **`HeartbeatMonitor`** (`heartbeat.go`) — Receives heartbeat updates from RegionalPoller via `UpdateHeartbeat` callback. Only scans for stale nodes in its own tick loop.
-- **`BucketAgent`** (`agent.go`) — Bridges bucket packets to local TCP connections (mirrors `pkg/agent/` for gRPC mode)
-- **`ReverseProxyHandler`** (`reverse_proxy.go`) — Handles reverse tunnel: agent sends HTTP requests to server, server proxies to a target (e.g., kubelet API)
-- **Sequence numbers**: Zero-padded to `seqWidth=20` digits in filenames for lexicographic ordering
+- **`BucketAgent`** (`agent.go`) — Bridges bucket packets to local TCP connections (mirrors `pkg/agent/` for gRPC mode). Maintains connID→streamID mapping.
+- **`BucketAgentStream`** (`server_backend.go`) — Server-side adapter implementing the gRPC agent interface. Resolves streamID from packet type (DIAL_REQ/DATA/CLOSE) and intercepts DIAL_RSP to learn connID→streamID mappings.
+- **`ReverseProxyHandler`** (`reverse_proxy_server.go`) — Server side of reverse tunnel: receives DIAL_REQ from agent, dials local target, relays data with per-stream sequencing.
+- **`ReverseProxy`** (`reverse_proxy.go`) — Agent side of reverse tunnel: accepts TCP connections, tunnels through bucket using `rc.random` as streamID.
+- **Sequence numbers**: Zero-padded to `seqWidth=20` digits in filenames for lexicographic ordering within each stream
 
 ### gRPC Protocol
 

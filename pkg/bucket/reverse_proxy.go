@@ -176,7 +176,7 @@ func (rp *ReverseProxy) handleConn(conn net.Conn) {
 			},
 		},
 	}
-	if err := rp.transport.Send(dialReq); err != nil {
+	if err := rp.transport.SendToStream(dialReq, random); err != nil {
 		klog.ErrorS(err, "Failed to send DIAL_REQ", "random", random)
 		rp.mu.Lock()
 		delete(rp.pending, random)
@@ -316,14 +316,14 @@ func (rp *ReverseProxy) localToRemote(rc *reverseConn) {
 		rc.close()
 
 		if stillTracked {
-			_ = rp.transport.Send(&client.Packet{
+			_ = rp.transport.SendToStream(&client.Packet{
 				Type: client.PacketType_CLOSE_REQ,
 				Payload: &client.Packet_CloseRequest{
 					CloseRequest: &client.CloseRequest{
 						ConnectID: rc.connectID,
 					},
 				},
-			})
+			}, rc.random)
 		}
 	}()
 
@@ -333,7 +333,7 @@ func (rp *ReverseProxy) localToRemote(rc *reverseConn) {
 		if n > 0 {
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			if sendErr := rp.transport.Send(&client.Packet{
+			if sendErr := rp.transport.SendToStream(&client.Packet{
 				Type: client.PacketType_DATA,
 				Payload: &client.Packet_Data{
 					Data: &client.Data{
@@ -341,7 +341,7 @@ func (rp *ReverseProxy) localToRemote(rc *reverseConn) {
 						ConnectID: rc.connectID,
 					},
 				},
-			}); sendErr != nil {
+			}, rc.random); sendErr != nil {
 				klog.ErrorS(sendErr, "Failed to send DATA", "connID", rc.connectID)
 				return
 			}

@@ -20,12 +20,14 @@ pod creation, and log fetch flows as protobuf files through cloud storage.
 └────────────────────────────┼─────────────┘       └────┼─────────────────────┘
                              │                          │
                              ▼     GCS Bucket           ▼
-                        ┌────────────────────────────────────┐
-                        │  control-to-node/{id}/msg-*.pb     │
-                        │  node-to-control/{id}/msg-*.pb     │
-                        │  node-to-control/{id}/heartbeat-*  │
-                        │  node-to-control/{id}/register     │
-                        └────────────────────────────────────┘
+                        ┌──────────────────────────────────────────────────┐
+                        │  control-to-node/{id}/fwd/{s}-{seq}.pb           │
+                        │  control-to-node/{id}/rev/{s}-{seq}.pb           │
+                        │  node-to-control/{id}/{s}-{seq}.pb               │
+                        │  node-to-control-reverse/{id}/{s}-{seq}.pb       │
+                        │  node-to-control/{id}/heartbeat-*                │
+                        │  node-to-control/{id}/register                   │
+                        └──────────────────────────────────────────────────┘
 ```
 
 ## Prerequisites
@@ -366,8 +368,14 @@ aspect as dramatically as the GCP variant with its deny-all-egress firewall.
 
 ## Architecture notes
 
+**Per-stream message isolation**: Each Konnectivity connection (identified by the
+DIAL request's `Random` field) gets its own independent sequence counter in the
+bucket. Filenames use the format `{streamID}-{seq}.pb`. This means a failed GCS
+write for one stream only blocks that stream — other streams on the same node
+continue delivering messages without head-of-line blocking.
+
 **Message retention for unregistered nodes**: The RegionalPoller preserves
 messages from unregistered nodes for 5 minutes before deleting them. This grace
 period allows agents to start before server discovery completes (via heartbeat),
 preventing message loss during startup. Once a node registers, any buffered
-messages are processed immediately in sequence order.
+messages are processed immediately in per-stream sequence order.

@@ -54,8 +54,8 @@ type BucketTransport struct {
 	sendPrefix   string // e.g. "control-to-node/node-1/"
 	recvPrefix   string // e.g. "node-to-control/node-1/"
 	sendMu       sync.Mutex
-	sendSeq      uint64
-	recvSeq      uint64 // only accessed by polling goroutine
+	sendSeqs     map[int64]uint64 // streamID → next sequence number
+	recvSeqs     map[int64]uint64 // streamID → last delivered seq (only accessed by polling goroutine)
 	pollInterval time.Duration
 	adaptive     bool // when true, dynamically adjust poll interval
 
@@ -76,6 +76,7 @@ type BucketTransport struct {
 // nagleBuffer accumulates DATA payloads for a single connectID.
 type nagleBuffer struct {
 	connectID int64
+	streamID  int64
 	data      []byte
 }
 
@@ -92,6 +93,8 @@ func NewBucketTransport(ctx context.Context, store Store, sendPrefix, recvPrefix
 		store:        store,
 		sendPrefix:   ensureTrailingSlash(sendPrefix),
 		recvPrefix:   ensureTrailingSlash(recvPrefix),
+		sendSeqs:     make(map[int64]uint64),
+		recvSeqs:     make(map[int64]uint64),
 		pollInterval: pollInterval,
 		adaptive:     adaptive,
 		nagleDelay:   nagleDelay,
@@ -113,6 +116,7 @@ func newSendOnlyTransport(ctx context.Context, store Store, sendPrefix string, n
 	t := &BucketTransport{
 		store:      store,
 		sendPrefix: ensureTrailingSlash(sendPrefix),
+		sendSeqs:   make(map[int64]uint64),
 		nagleDelay: nagleDelay,
 		ctx:        ctx,
 		cancel:     cancel,
@@ -124,14 +128,15 @@ func newSendOnlyTransport(ctx context.Context, store Store, sendPrefix string, n
 	return t
 }
 
-// Send marshals a Konnectivity Packet and writes it to the bucket.
+// SendToStream marshals a Konnectivity Packet and writes it to the bucket
+// under the given streamID's independent sequence counter.
 // When Nagle buffering is enabled, DATA packets are coalesced per connectID
 // and flushed after the Nagle delay or when the buffer exceeds nagleMaxBytes.
 // Non-DATA packets are sent immediately and trigger a flush of any buffered data.
-func (t *BucketTransport) Send(pkt *client.Packet) error {
+func (t *BucketTransport) SendToStream(pkt *client.Packet, streamID int64) error {
 	if t.nagleDelay > 0 && pkt.Type == client.PacketType_DATA {
 		if d := pkt.GetData(); d != nil && len(d.Data) > 0 {
-			return t.nagleSend(d.ConnectID, d.Data)
+			return t.nagleSend(d.ConnectID, streamID, d.Data)
 		}
 	}
 
@@ -139,13 +144,17 @@ func (t *BucketTransport) Send(pkt *client.Packet) error {
 	if t.nagleDelay > 0 {
 		t.nagleFlushAll()
 	}
-	return t.sendImmediate(pkt)
+	return t.sendImmediate(pkt, streamID)
 }
 
 // sendImmediate marshals and writes a single packet to the bucket.
 // The sequence number is only advanced after a successful Put, so a
 // transient failure does not leave a gap that blocks the receiver.
-func (t *BucketTransport) sendImmediate(pkt *client.Packet) error {
+func (t *BucketTransport) sendImmediate(pkt *client.Packet, streamID int64) error {
+	if t.ctx.Err() != nil {
+		return t.ctx.Err()
+	}
+
 	data, err := proto.Marshal(pkt)
 	if err != nil {
 		return fmt.Errorf("marshal packet: %w", err)
@@ -154,25 +163,25 @@ func (t *BucketTransport) sendImmediate(pkt *client.Packet) error {
 	t.sendMu.Lock()
 	defer t.sendMu.Unlock()
 
-	seq := t.sendSeq + 1
-	key := fmt.Sprintf("%s%0*d%s", t.sendPrefix, seqWidth, seq, fileSuffix)
+	seq := t.sendSeqs[streamID] + 1
+	key := fmt.Sprintf("%s%d-%0*d%s", t.sendPrefix, streamID, seqWidth, seq, fileSuffix)
 
 	if err := t.store.Put(t.ctx, key, data); err != nil {
 		return fmt.Errorf("bucket put %s: %w", key, err)
 	}
-	t.sendSeq = seq
+	t.sendSeqs[streamID] = seq
 	return nil
 }
 
 // nagleSend buffers DATA payload bytes for a connectID. Flushes when the
 // buffer exceeds nagleMaxBytes or after the Nagle delay timer fires.
-func (t *BucketTransport) nagleSend(connectID int64, payload []byte) error {
+func (t *BucketTransport) nagleSend(connectID, streamID int64, payload []byte) error {
 	t.nagleMu.Lock()
 	defer t.nagleMu.Unlock()
 
 	buf, ok := t.nagleBufs[connectID]
 	if !ok {
-		buf = &nagleBuffer{connectID: connectID}
+		buf = &nagleBuffer{connectID: connectID, streamID: streamID}
 		t.nagleBufs[connectID] = buf
 	}
 	buf.data = append(buf.data, payload...)
@@ -241,7 +250,7 @@ func (t *BucketTransport) flushBufferLocked(connectID int64, buf *nagleBuffer) e
 			},
 		},
 	}
-	return t.sendImmediate(pkt)
+	return t.sendImmediate(pkt, buf.streamID)
 }
 
 // Recv blocks until a packet is available or the transport is closed.
@@ -313,12 +322,12 @@ func (t *BucketTransport) pollOnce() bool {
 
 	found := false
 	for _, key := range keys {
-		seq, err := parseSeqFromKey(key)
+		streamID, seq, err := parseStreamAndSeqFromKey(key)
 		if err != nil {
 			klog.V(4).InfoS("Skipping unparseable key", "key", key, "err", err)
 			continue
 		}
-		if seq <= t.recvSeq {
+		if seq <= t.recvSeqs[streamID] {
 			// Already processed; delete it.
 			_ = t.store.Delete(t.ctx, key)
 			continue
@@ -340,7 +349,7 @@ func (t *BucketTransport) pollOnce() bool {
 			continue
 		}
 
-		t.recvSeq = seq
+		t.recvSeqs[streamID] = seq
 		found = true
 
 		// Delete after successful read.
@@ -355,8 +364,9 @@ func (t *BucketTransport) pollOnce() bool {
 	return found
 }
 
-// parseSeqFromKey extracts the sequence number from a key like "prefix/00000000001.pb".
-func parseSeqFromKey(key string) (uint64, error) {
+// parseStreamAndSeqFromKey extracts the stream ID and sequence number from a
+// key like "prefix/12345-00000000001.pb". The filename format is {streamID}-{seqID}.pb.
+func parseStreamAndSeqFromKey(key string) (streamID int64, seq uint64, err error) {
 	// Get the filename part after the last slash.
 	idx := strings.LastIndex(key, "/")
 	name := key
@@ -365,5 +375,22 @@ func parseSeqFromKey(key string) (uint64, error) {
 	}
 	// Strip suffix.
 	name = strings.TrimSuffix(name, fileSuffix)
-	return strconv.ParseUint(name, 10, 64)
+
+	// Split on first '-' to get streamID and seqID.
+	dashIdx := strings.Index(name, "-")
+	if dashIdx < 0 {
+		return 0, 0, fmt.Errorf("key %q missing stream-seq separator", key)
+	}
+
+	streamID, err = strconv.ParseInt(name[:dashIdx], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse streamID from %q: %w", key, err)
+	}
+
+	seq, err = strconv.ParseUint(name[dashIdx+1:], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse seqID from %q: %w", key, err)
+	}
+
+	return streamID, seq, nil
 }
