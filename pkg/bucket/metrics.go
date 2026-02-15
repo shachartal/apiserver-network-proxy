@@ -168,6 +168,10 @@ func (s *MetricsStore) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+func (s *MetricsStore) Close() error {
+	return s.inner.Close()
+}
+
 func (s *MetricsStore) ListRecursive(ctx context.Context, prefix string) ([]string, error) {
 	start := time.Now()
 	keys, err := s.inner.ListRecursive(ctx, prefix)

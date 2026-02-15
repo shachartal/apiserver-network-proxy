@@ -50,7 +50,11 @@ func TestReverseProxy_EndToEnd(t *testing.T) {
 
 	// 3. Create server-side ReverseProxyHandler pointing at the echo server.
 	// The echo server address is the target the handler will always dial.
-	handler := NewReverseProxyHandler(ctx, store, "node-1", echoServer.Listener.Addr().String(), 50*time.Millisecond, 0)
+	serverPoller := NewRegionalPoller(ctx, store, "node-to-control-reverse/")
+	serverPoller.SetWorkerCount(2)
+	go serverPoller.Run()
+	t.Cleanup(serverPoller.Stop)
+	handler := NewReverseProxyHandler(ctx, store, "node-1", echoServer.Listener.Addr().String(), serverPoller, 0)
 	go handler.Serve()
 	t.Cleanup(handler.Stop)
 
@@ -134,7 +138,11 @@ func TestReverseProxy_MultipleConnections(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	handler := NewReverseProxyHandler(ctx, store, "node-2", echoListener.Addr().String(), 50*time.Millisecond, 0)
+	serverPoller := NewRegionalPoller(ctx, store, "node-to-control-reverse/")
+	serverPoller.SetWorkerCount(2)
+	go serverPoller.Run()
+	t.Cleanup(serverPoller.Stop)
+	handler := NewReverseProxyHandler(ctx, store, "node-2", echoListener.Addr().String(), serverPoller, 0)
 	go handler.Serve()
 	t.Cleanup(handler.Stop)
 

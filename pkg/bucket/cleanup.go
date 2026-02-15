@@ -90,7 +90,7 @@ func (c *CleanupWorker) sweep() {
 }
 
 func (c *CleanupWorker) sweepPrefix(prefix string) int {
-	keys, err := c.store.List(c.ctx, prefix)
+	keys, err := c.store.ListRecursive(c.ctx, prefix)
 	if err != nil {
 		if c.ctx.Err() != nil {
 			return 0
@@ -106,14 +106,9 @@ func (c *CleanupWorker) sweepPrefix(prefix string) int {
 			continue
 		}
 
-		// For Store implementations that support metadata/timestamps, we could
-		// check modification time. For FSStore and general bucket stores, we
-		// rely on the sequence-based approach: if the transport has already
-		// advanced past this sequence, the message is safe to delete.
-		//
-		// For now, we do a best-effort cleanup of any .pb files that remain.
-		// The transport's pollOnce already deletes messages after reading them,
-		// so files here are orphans from failed deletes or race conditions.
+		// Best-effort cleanup of any .pb files that remain. The poller
+		// already deletes messages after reading them, so files here are
+		// orphans from failed deletes or race conditions.
 		if err := c.store.Delete(c.ctx, key); err != nil {
 			if c.ctx.Err() != nil {
 				return deleted

@@ -83,7 +83,7 @@ func TestRegionalPoller_EndToEnd(t *testing.T) {
 	t.Cleanup(poller.Stop)
 
 	// Register agent using the regional poller.
-	transport := RegisterBucketAgentWithPoller(ps, store, "node-1", poller, 0)
+	transport := RegisterBucketAgent(ps, store, "node-1", poller, 0)
 	t.Cleanup(transport.Close)
 
 	// Start the BucketAgent with AgentPoller for consolidated polling.
@@ -176,7 +176,7 @@ func TestRegionalPoller_UnknownNodeGracePeriod(t *testing.T) {
 			},
 		},
 	}
-	transport := newSendOnlyTransport(ctx, store, prefix, 0)
+	transport := NewBucketTransport(ctx, store, prefix, 0)
 	if err := transport.SendToStream(pkt, 123); err != nil {
 		t.Fatalf("Failed to write message: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestRegionalPoller_UnknownNodeGracePeriodExpiry(t *testing.T) {
 			},
 		},
 	}
-	transport := newSendOnlyTransport(ctx, store, prefix, 0)
+	transport := NewBucketTransport(ctx, store, prefix, 0)
 	if err := transport.SendToStream(pkt, 456); err != nil {
 		t.Fatalf("Failed to write message: %v", err)
 	}

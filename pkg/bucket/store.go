@@ -37,4 +37,7 @@ type Store interface {
 
 	// Delete removes the object at the given key.
 	Delete(ctx context.Context, key string) error
+
+	// Close releases any resources held by the store (e.g., network connections).
+	Close() error
 }

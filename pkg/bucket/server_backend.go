@@ -124,36 +124,18 @@ func (s *BucketAgentStream) RecvMsg(_ interface{}) error {
 	return nil
 }
 
-// RegisterBucketAgent creates a bucket-backed agent stream and registers it
-// with the ProxyServer. The ProxyServer will treat this as a connected agent
-// and route traffic to/from it via the bucket.
+// RegisterBucketAgent registers a bucket-backed agent that receives messages
+// from a RegionalPoller. The poller handles LIST operations centrally for all
+// nodes in the region. Returns a send-only BucketTransport (polling disabled;
+// recv comes from the poller).
 //
 // This function starts a goroutine that runs ProxyServer.Connect() — it blocks
-// until the transport is closed. Returns the transport so the caller can close it.
-func RegisterBucketAgent(ps *server.ProxyServer, store Store, nodeID string, pollInterval, nagleDelay time.Duration) *BucketTransport {
-	ctx := context.Background()
-
-	// Server sends to control-to-node/{nodeID}/fwd/, receives from node-to-control/{nodeID}/
-	transport := NewBucketTransport(ctx, store,
-		"control-to-node/"+nodeID+"/fwd/",
-		"node-to-control/"+nodeID+"/",
-		pollInterval,
-		nagleDelay,
-	)
-
-	connectTransport(ps, transport, nodeID)
-	return transport
-}
-
-// RegisterBucketAgentWithPoller registers a bucket-backed agent that receives
-// messages from a RegionalPoller instead of polling independently. The poller
-// handles LIST operations centrally for all nodes in the region.
-// Returns a send-only BucketTransport (polling disabled; recv comes from the poller).
-func RegisterBucketAgentWithPoller(ps *server.ProxyServer, store Store, nodeID string, poller *RegionalPoller, nagleDelay time.Duration) *BucketTransport {
+// until the transport is closed.
+func RegisterBucketAgent(ps *server.ProxyServer, store Store, nodeID string, poller *RegionalPoller, nagleDelay time.Duration) *BucketTransport {
 	ctx := context.Background()
 
 	// Create a send-only transport (no polling — the poller handles recv).
-	sendTransport := newSendOnlyTransport(ctx, store, "control-to-node/"+nodeID+"/fwd/", nagleDelay)
+	sendTransport := NewBucketTransport(ctx, store, "control-to-node/"+nodeID+"/fwd/", nagleDelay)
 
 	// Register with the poller to receive packets.
 	recvCh := poller.RegisterNode(nodeID)

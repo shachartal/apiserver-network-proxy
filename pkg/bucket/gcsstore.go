@@ -53,6 +53,10 @@ func NewGCSStore(ctx context.Context, bucketName, prefix string, opts ...option.
 		return nil, fmt.Errorf("accessing GCS bucket %q: %w", bucketName, err)
 	}
 
+	// Retry all operations (including non-idempotent) with the GCS client's
+	// built-in exponential backoff, replacing our custom RetryStore wrapper.
+	client.SetRetry(storage.WithPolicy(storage.RetryAlways))
+
 	return &GCSStore{
 		client: client,
 		bucket: bucketName,

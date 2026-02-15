@@ -96,7 +96,7 @@ func TestNagle_CoalescesSmallDataPackets(t *testing.T) {
 	defer cancel()
 
 	// Use a long Nagle delay so packets stay buffered.
-	transport := newSendOnlyTransport(ctx, store, "test/send/", 5*time.Second)
+	transport := NewBucketTransport(ctx, store, "test/send/", 5*time.Second)
 	defer transport.Close()
 
 	// Send three small DATA packets for the same connectID.
@@ -138,7 +138,7 @@ func TestNagle_NonDataFlushesBuffer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	transport := newSendOnlyTransport(ctx, store, "test/send/", 5*time.Second)
+	transport := NewBucketTransport(ctx, store, "test/send/", 5*time.Second)
 	defer transport.Close()
 
 	// Buffer some DATA.
@@ -177,7 +177,7 @@ func TestNagle_TimerFlush(t *testing.T) {
 	defer cancel()
 
 	// Use a short Nagle delay.
-	transport := newSendOnlyTransport(ctx, store, "test/send/", 50*time.Millisecond)
+	transport := NewBucketTransport(ctx, store, "test/send/", 50*time.Millisecond)
 	defer transport.Close()
 
 	if err := transport.SendToStream(makeDataPacket(7, []byte("timer-test")), testStreamID); err != nil {
@@ -209,7 +209,7 @@ func TestNagle_SizeThresholdFlush(t *testing.T) {
 	defer cancel()
 
 	// Use a long delay so only size triggers flush.
-	transport := newSendOnlyTransport(ctx, store, "test/send/", 10*time.Second)
+	transport := NewBucketTransport(ctx, store, "test/send/", 10*time.Second)
 	defer transport.Close()
 
 	// Send a payload larger than nagleMaxBytes (32KB).
@@ -237,7 +237,7 @@ func TestNagle_PerConnectIDIsolation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	transport := newSendOnlyTransport(ctx, store, "test/send/", 5*time.Second)
+	transport := NewBucketTransport(ctx, store, "test/send/", 5*time.Second)
 	defer transport.Close()
 
 	// Buffer data for two different connectIDs (same streamID).
@@ -286,7 +286,7 @@ func TestNagle_DisabledSendsImmediately(t *testing.T) {
 	defer cancel()
 
 	// nagleDelay=0 means disabled.
-	transport := newSendOnlyTransport(ctx, store, "test/send/", 0)
+	transport := NewBucketTransport(ctx, store, "test/send/", 0)
 	defer transport.Close()
 
 	if err := transport.SendToStream(makeDataPacket(1, []byte("immediate")), testStreamID); err != nil {
@@ -312,7 +312,7 @@ func TestSendImmediate_NoSeqAdvanceOnPutFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	transport := newSendOnlyTransport(ctx, es, "test/send/", 0)
+	transport := NewBucketTransport(ctx, es, "test/send/", 0)
 	defer transport.Close()
 
 	// First two sends should fail.

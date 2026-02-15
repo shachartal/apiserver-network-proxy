@@ -95,7 +95,7 @@ func NewReverseProxy(ctx context.Context, store Store, nodeID, listenAddr string
 
 	ctx, cancel := context.WithCancel(ctx)
 	// Send-only transport; recv is fed by AgentPoller.
-	transport := newSendOnlyTransport(ctx, store,
+	transport := NewBucketTransport(ctx, store,
 		"node-to-control-reverse/"+nodeID+"/",
 		nagleDelay,
 	)

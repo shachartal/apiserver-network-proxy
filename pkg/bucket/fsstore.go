@@ -129,6 +129,9 @@ func (s *FSStore) Delete(_ context.Context, key string) error {
 	return err
 }
 
+// Close is a no-op for filesystem-backed stores.
+func (s *FSStore) Close() error { return nil }
+
 var _ Store = (*FSStore)(nil)
 
 // Ensure prefix ends with "/" for directory semantics.
