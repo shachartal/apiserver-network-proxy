@@ -73,8 +73,8 @@ type BucketProxyServer struct {
 	reverseProxyTarget string
 
 	mu              sync.Mutex
-	transports      map[string]*bucket.BucketTransport       // nodeID → transport
-	reverseHandlers map[string]*bucket.ReverseProxyHandler    // nodeID → reverse handler
+	transports      map[string]*bucket.BucketTransport     // nodeID → transport
+	reverseHandlers map[string]*bucket.ReverseProxyHandler // nodeID → reverse handler
 }
 
 func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-chan struct{}) error {
@@ -90,7 +90,7 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 	if err != nil {
 		return fmt.Errorf("failed to create store: %v", err)
 	}
-	store := bucket.NewMetricsStore(bucket.NewRetryStore(rawStore, bucket.DefaultRetryPolicy()))
+	store := bucket.NewMetricsStore(rawStore)
 	p.store = store
 	p.nagleDelay = o.NagleDelay
 	p.reverseProxyTarget = o.ReverseProxyTarget
@@ -193,6 +193,8 @@ func (p *BucketProxyServer) Run(o *options.BucketProxyServerOptions, stopCh <-ch
 		p.adminServer.Close()
 	}
 
+	p.store.Close()
+
 	return nil
 }
 
@@ -215,12 +217,12 @@ func (p *BucketProxyServer) registerNode(nodeID string) {
 	}
 
 	klog.V(1).Infof("Discovered new agent %q via heartbeat — registering", nodeID)
-	transport := bucket.RegisterBucketAgentWithPoller(p.proxyServer, p.store, nodeID, p.poller, p.nagleDelay)
+	transport := bucket.RegisterBucketAgent(p.proxyServer, p.store, nodeID, p.poller, p.nagleDelay)
 	p.transports[nodeID] = transport
 
 	// Start reverse proxy handler for this node if enabled.
 	if p.reverseProxyTarget != "" && p.reversePoller != nil {
-		rh := bucket.NewReverseProxyHandlerWithPoller(context.Background(), p.store, nodeID, p.reverseProxyTarget, p.reversePoller, p.nagleDelay)
+		rh := bucket.NewReverseProxyHandler(context.Background(), p.store, nodeID, p.reverseProxyTarget, p.reversePoller, p.nagleDelay)
 		p.reverseHandlers[nodeID] = rh
 		go rh.Serve()
 		klog.V(1).Infof("Started reverse proxy handler for node %q → %s", nodeID, p.reverseProxyTarget)

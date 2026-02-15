@@ -47,17 +47,13 @@ const (
 )
 
 // BucketTransport provides Send/Recv semantics over a bucket Store.
-// Each transport is bound to a specific send prefix and recv prefix,
-// representing one direction pair (e.g., server→node and node→server).
+// Each transport is bound to a specific send prefix. Recv is fed externally
+// (e.g., by a RegionalPoller pushing to recvCh).
 type BucketTransport struct {
-	store        Store
-	sendPrefix   string // e.g. "control-to-node/node-1/"
-	recvPrefix   string // e.g. "node-to-control/node-1/"
-	sendMu       sync.Mutex
-	sendSeqs     map[int64]uint64 // streamID → next sequence number
-	recvSeqs     map[int64]uint64 // streamID → last delivered seq (only accessed by polling goroutine)
-	pollInterval time.Duration
-	adaptive     bool // when true, dynamically adjust poll interval
+	store      Store
+	sendPrefix string // e.g. "control-to-node/node-1/"
+	sendMu     sync.Mutex
+	sendSeqs   map[int64]uint64 // streamID → next sequence number
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -80,38 +76,10 @@ type nagleBuffer struct {
 	data      []byte
 }
 
-// NewBucketTransport creates a transport that sends to sendPrefix and receives from recvPrefix.
-// If pollInterval is 0, adaptive polling is enabled (500ms–10s based on activity).
+// NewBucketTransport creates a send-only transport. Recv is fed externally
+// (e.g., by a RegionalPoller pushing to recvCh).
 // If nagleDelay is > 0, small DATA packets are coalesced and flushed after the delay.
-func NewBucketTransport(ctx context.Context, store Store, sendPrefix, recvPrefix string, pollInterval, nagleDelay time.Duration) *BucketTransport {
-	adaptive := pollInterval == 0
-	if adaptive {
-		pollInterval = minPollInterval
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	t := &BucketTransport{
-		store:        store,
-		sendPrefix:   ensureTrailingSlash(sendPrefix),
-		recvPrefix:   ensureTrailingSlash(recvPrefix),
-		sendSeqs:     make(map[int64]uint64),
-		recvSeqs:     make(map[int64]uint64),
-		pollInterval: pollInterval,
-		adaptive:     adaptive,
-		nagleDelay:   nagleDelay,
-		ctx:          ctx,
-		cancel:       cancel,
-		recvCh:       make(chan *client.Packet, 100),
-	}
-	if nagleDelay > 0 {
-		t.nagleBufs = make(map[int64]*nagleBuffer)
-	}
-	go t.pollLoop()
-	return t
-}
-
-// newSendOnlyTransport creates a transport that can only send. Recv is fed
-// externally (e.g., by a RegionalPoller pushing to recvCh).
-func newSendOnlyTransport(ctx context.Context, store Store, sendPrefix string, nagleDelay time.Duration) *BucketTransport {
+func NewBucketTransport(ctx context.Context, store Store, sendPrefix string, nagleDelay time.Duration) *BucketTransport {
 	ctx, cancel := context.WithCancel(ctx)
 	t := &BucketTransport{
 		store:      store,
@@ -267,101 +235,12 @@ func (t *BucketTransport) Recv() (*client.Packet, error) {
 	}
 }
 
-// Close flushes any buffered Nagle data, then shuts down the transport and its polling goroutine.
+// Close flushes any buffered Nagle data, then shuts down the transport.
 func (t *BucketTransport) Close() {
 	if t.nagleDelay > 0 {
 		t.nagleFlushAll()
 	}
 	t.cancel()
-}
-
-// pollLoop continuously polls the bucket for new messages and pushes them to recvCh.
-func (t *BucketTransport) pollLoop() {
-	defer close(t.recvCh)
-
-	currentInterval := t.pollInterval
-	timer := time.NewTimer(currentInterval)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-t.ctx.Done():
-			return
-		case <-timer.C:
-			found := t.pollOnce()
-			if t.adaptive {
-				currentInterval = t.nextInterval(currentInterval, found)
-			}
-			timer.Reset(currentInterval)
-		}
-	}
-}
-
-// nextInterval computes the next poll interval based on whether messages were found.
-func (t *BucketTransport) nextInterval(current time.Duration, foundMessages bool) time.Duration {
-	if foundMessages {
-		return minPollInterval
-	}
-	next := time.Duration(float64(current) * backoffMultiplier)
-	if next > maxPollInterval {
-		return maxPollInterval
-	}
-	return next
-}
-
-// pollOnce polls for new messages. Returns true if any messages were found and processed.
-func (t *BucketTransport) pollOnce() bool {
-	keys, err := t.store.List(t.ctx, t.recvPrefix)
-	if err != nil {
-		if t.ctx.Err() != nil {
-			return false
-		}
-		klog.V(4).InfoS("Bucket list error", "prefix", t.recvPrefix, "err", err)
-		return false
-	}
-
-	found := false
-	for _, key := range keys {
-		streamID, seq, err := parseStreamAndSeqFromKey(key)
-		if err != nil {
-			klog.V(4).InfoS("Skipping unparseable key", "key", key, "err", err)
-			continue
-		}
-		if seq <= t.recvSeqs[streamID] {
-			// Already processed; delete it.
-			_ = t.store.Delete(t.ctx, key)
-			continue
-		}
-
-		data, err := t.store.Get(t.ctx, key)
-		if err != nil {
-			if t.ctx.Err() != nil {
-				return found
-			}
-			klog.V(4).InfoS("Bucket get error", "key", key, "err", err)
-			continue
-		}
-
-		pkt := &client.Packet{}
-		if err := proto.Unmarshal(data, pkt); err != nil {
-			klog.ErrorS(err, "Failed to unmarshal packet", "key", key)
-			_ = t.store.Delete(t.ctx, key)
-			continue
-		}
-
-		t.recvSeqs[streamID] = seq
-		found = true
-
-		// Delete after successful read.
-		_ = t.store.Delete(t.ctx, key)
-
-		select {
-		case t.recvCh <- pkt:
-		case <-t.ctx.Done():
-			return found
-		}
-	}
-	return found
 }
 
 // parseStreamAndSeqFromKey extracts the stream ID and sequence number from a

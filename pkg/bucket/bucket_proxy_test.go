@@ -52,9 +52,9 @@ func TestBucketProxy_EndToEnd(t *testing.T) {
 	ps := server.NewProxyServer(
 		"test-server",
 		[]proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault},
-		1,  // serverCount
+		1, // serverCount
 		&server.AgentTokenAuthenticationOptions{}, // no agent auth
-		10,  // xfr channel size
+		10, // xfr channel size
 	)
 
 	// 3. Start a gRPC frontend server on a unix socket.
@@ -68,8 +68,13 @@ func TestBucketProxy_EndToEnd(t *testing.T) {
 	go grpcServer.Serve(lis)
 	t.Cleanup(grpcServer.Stop)
 
-	// 4. Register a bucket-backed "agent" with the ProxyServer.
-	transport := RegisterBucketAgent(ps, store, "node-1", 50*time.Millisecond, 0)
+	// 4. Register a bucket-backed "agent" with the ProxyServer via RegionalPoller.
+	ctx := context.Background()
+	poller := NewRegionalPoller(ctx, store, "node-to-control/")
+	poller.SetWorkerCount(2)
+	go poller.Run()
+	t.Cleanup(poller.Stop)
+	transport := RegisterBucketAgent(ps, store, "node-1", poller, 0)
 	t.Cleanup(transport.Close)
 
 	// 5. Start the BucketAgent and AgentPoller for consolidated polling.

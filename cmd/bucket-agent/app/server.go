@@ -73,7 +73,8 @@ func (a *BucketProxyAgent) Run(o *options.BucketProxyAgentOptions, stopCh <-chan
 	if err != nil {
 		return fmt.Errorf("failed to create store: %v", err)
 	}
-	store := bucket.NewMetricsStore(bucket.NewRetryStore(rawStore, bucket.DefaultRetryPolicy()))
+	store := bucket.NewMetricsStore(rawStore)
+	defer store.Close()
 
 	// Create the bucket agent (send-only transport; receive handled by AgentPoller).
 	a.agent = bucket.NewBucketAgent(ctx, store, o.NodeID, o.NagleDelay)

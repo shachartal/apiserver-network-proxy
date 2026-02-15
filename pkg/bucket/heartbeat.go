@@ -163,8 +163,8 @@ type HeartbeatMonitor struct {
 	timeout      time.Duration
 
 	mu        sync.RWMutex
-	lastSeen  map[string]time.Time   // nodeID → last heartbeat time
-	lastHBKey map[string]string      // nodeID → last heartbeat key seen (to avoid re-parses)
+	lastSeen  map[string]time.Time // nodeID → last heartbeat time
+	lastHBKey map[string]string    // nodeID → last heartbeat key seen (to avoid re-parses)
 
 	ctx    context.Context
 	cancel context.CancelFunc
