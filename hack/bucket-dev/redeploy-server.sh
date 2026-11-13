@@ -16,12 +16,12 @@
 # redeploy-server.sh — Rebuild and redeploy bucket-proxy-server after code changes.
 #
 # This script:
-#   1. Rebuilds the Go binary for the current architecture
-#   2. Rebuilds the Docker image
-#   3. Imports it into k3d
+#   1. Rebuilds the Go binary for the underlay's architecture
+#   2. Rebuilds the container image
+#   3. k3d: imports it into k3d; gke: pushes it to Artifact Registry
 #   4. Rolls out the kube-apiserver Deployment with the new image
 #
-# Usage: ./redeploy-server.sh
+# Usage: ./redeploy-server.sh            (UNDERLAY=k3d|gke, see lib-underlay.sh)
 
 set -euo pipefail
 
@@ -35,56 +35,51 @@ if [ -f "$SCRIPT_DIR/demo.env" ]; then
     set +a
 fi
 
-CLUSTER_NAME="bucket-dev"
-NAMESPACE="overlay-system"
 GCS_BUCKET="${GCS_BUCKET:-}"
 GCS_PREFIX="${GCS_PREFIX:-bucket-dev/}"
 
-# Detect target architecture.
-HOST_ARCH="$(uname -m)"
-case "$HOST_ARCH" in
-    x86_64)  GOARCH="amd64" ;;
-    aarch64|arm64) GOARCH="arm64" ;;
-    *) echo "ERROR: unsupported architecture $HOST_ARCH"; exit 1 ;;
-esac
+source "$SCRIPT_DIR/lib-underlay.sh"
 
-echo "==> Building bucket-proxy-server for linux/${GOARCH}..."
-cd "$REPO_ROOT"
-GOOS=linux GOARCH=$GOARCH go build -o "bin/bucket-proxy-server-linux-${GOARCH}" ./cmd/bucket-server
-
-echo "==> Building Docker image..."
-TMPIMG=$(mktemp -d)
-cp "$REPO_ROOT/bin/bucket-proxy-server-linux-${GOARCH}" "$TMPIMG/bucket-proxy-server"
-cat > "$TMPIMG/Dockerfile" <<'DOCKERFILE'
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY bucket-proxy-server /bucket-proxy-server
-ENTRYPOINT ["/bucket-proxy-server"]
-DOCKERFILE
-
-docker build -t bucket-proxy-server:dev "$TMPIMG"
-rm -rf "$TMPIMG"
-
-echo "==> Importing image into k3d cluster..."
-k3d image import bucket-proxy-server:dev -c "$CLUSTER_NAME"
-
-echo "==> Rolling out kube-apiserver..."
 if [ -z "$GCS_BUCKET" ]; then
     echo "ERROR: GCS_BUCKET must be set (or use demo.env)"
     exit 1
 fi
-sed -e "s|GCS_BUCKET_PLACEHOLDER|${GCS_BUCKET}|g" \
-    -e "s|GCS_PREFIX_PLACEHOLDER|${GCS_PREFIX}|g" \
-    "$SCRIPT_DIR/manifests/apiserver.yaml" | kubectl apply -f -
-# The image tag (bucket-proxy-server:dev) is reused, so the pod template is
-# unchanged and apply alone would not roll.
-kubectl -n "$NAMESPACE" rollout restart deployment/kube-apiserver
+underlay_check_gke_vars
+
+echo "==> Building bucket-proxy-server for linux/${SERVER_GOARCH}..."
+cd "$REPO_ROOT"
+GOOS=linux GOARCH=$SERVER_GOARCH go build -o "bin/bucket-proxy-server-linux-${SERVER_GOARCH}" ./cmd/bucket-server
+
+if is_gke; then
+    echo "==> Building and pushing image to Artifact Registry..."
+    gke_ensure_context
+    ar_login
+    push_server_image_gke
+else
+    echo "==> Building Docker image..."
+    build_server_image "$SERVER_GOARCH" "$SERVER_IMAGE"
+
+    echo "==> Importing image into k3d cluster..."
+    k3d image import "$SERVER_IMAGE" -c "$K3D_CLUSTER_NAME"
+fi
+
+echo "==> Rolling out kube-apiserver..."
+apply_manifest apiserver
+if ! is_gke; then
+    # k3d reuses the tag bucket-proxy-server:dev, so the pod template is
+    # unchanged and apply alone would not roll. (GKE deploys by digest, which
+    # changes the template and triggers a rollout.)
+    ukubectl -n "$NAMESPACE" rollout restart deployment/kube-apiserver
+fi
 
 echo "==> Waiting for kube-apiserver to be ready..."
-kubectl -n "$NAMESPACE" rollout status deployment/kube-apiserver --timeout=120s
+ukubectl -n "$NAMESPACE" rollout status deployment/kube-apiserver --timeout="$APISERVER_WAIT_TIMEOUT"
+
+# The port-forward was bound to the old pod; restart it.
+start_overlay_port_forward
 
 echo ""
 echo "==> Server redeployed successfully!"
 echo ""
 echo "Check logs with:"
-echo "  kubectl -n $NAMESPACE logs deploy/kube-apiserver -c bucket-proxy-server -f"
+echo "  kubectl --context $UNDERLAY_CONTEXT -n $NAMESPACE logs deploy/kube-apiserver -c bucket-proxy-server -f"

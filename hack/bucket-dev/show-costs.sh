@@ -25,8 +25,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Auto-source demo.env if present (for UNDERLAY and GKE settings).
+if [ -f "$SCRIPT_DIR/demo.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/demo.env"
+    set +a
+fi
+
+# Provides ukubectl (underlay context + flags) and NAMESPACE.
+source "$SCRIPT_DIR/lib-underlay.sh"
+
 NODE_ID="${NODE_ID:-}"
-NAMESPACE="${NAMESPACE:-overlay-system}"
 AGENT_ADMIN_PORT="${AGENT_ADMIN_PORT:-8094}"
 SERVER_ADMIN_PORT="${SERVER_ADMIN_PORT:-8095}"
 
@@ -51,7 +60,7 @@ fetch_server_metrics() {
     else
         # Use port-forward since the server container may not have curl/wget.
         local local_port=18095
-        kubectl -n "$NAMESPACE" port-forward deploy/kube-apiserver "${local_port}:${SERVER_ADMIN_PORT}" &>/dev/null &
+        ukubectl -n "$NAMESPACE" port-forward deploy/kube-apiserver "${local_port}:${SERVER_ADMIN_PORT}" &>/dev/null &
         local pf_pid=$!
         sleep 2
         curl -s "http://127.0.0.1:${local_port}/metrics" 2>/dev/null || echo ""

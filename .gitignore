@@ -23,3 +23,14 @@ tests.test
 
 # bucket-dev local config
 hack/bucket-dev/demo.env
+
+# terraform local artifacts (state, provider cache, saved plans, local vars)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+*.tfplan
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log

@@ -28,7 +28,8 @@
 #   VM_BACKEND          — "multipass" (default) or "gcp"
 #   GCP_PROJECT         — GCP project ID (required when VM_BACKEND=gcp)
 #   GCP_ZONE            — GCP zone (default: "us-east1-b")
-#   NAMESPACE           — kubernetes namespace (default: overlay-system)
+#   UNDERLAY            — "k3d" (default) or "gke"; selects the cluster hosting
+#                         the overlay control plane (see lib-underlay.sh)
 
 set -euo pipefail
 
@@ -47,7 +48,10 @@ NODE_ID="${NODE_ID:?NODE_ID environment variable is required}"
 VM_BACKEND="${VM_BACKEND:-multipass}"
 GCP_PROJECT="${GCP_PROJECT:-}"
 GCP_ZONE="${GCP_ZONE:-us-east1-b}"
-NAMESPACE="${NAMESPACE:-overlay-system}"
+
+# Provides ukubectl (underlay context + flags) and NAMESPACE.
+source "$SCRIPT_DIR/lib-underlay.sh"
+
 AGENT_ADMIN_PORT="${AGENT_ADMIN_PORT:-8094}"
 SERVER_ADMIN_PORT="${SERVER_ADMIN_PORT:-8095}"
 WORKLOAD_NAME="benchmark-log-generator"
@@ -126,7 +130,7 @@ collect_metrics() {
     local local_port=18095
 
     # Start a long-lived port-forward for the server metrics.
-    kubectl -n "$NAMESPACE" port-forward deploy/kube-apiserver "${local_port}:${SERVER_ADMIN_PORT}" &>/dev/null &
+    ukubectl -n "$NAMESPACE" port-forward deploy/kube-apiserver "${local_port}:${SERVER_ADMIN_PORT}" &>/dev/null &
     local pf_pid=$!
     sleep 2
 
@@ -189,7 +193,7 @@ echo ""
 log "Generating cost report..."
 echo ""
 
-export NODE_ID NAMESPACE AGENT_ADMIN_PORT SERVER_ADMIN_PORT
+export NODE_ID AGENT_ADMIN_PORT SERVER_ADMIN_PORT
 bash "$SCRIPT_DIR/show-costs.sh" "$OUTPUT_DIR"
 
 echo ""

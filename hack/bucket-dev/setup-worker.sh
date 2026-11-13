@@ -39,6 +39,9 @@
 #                          GCP_ZONE, from terraform output)
 #   GCP_SERVICE_ACCOUNT  — Worker node service account email (default: derived
 #                          from GCP_PROJECT, from terraform output)
+#   GCP_LABELS           — Optional VM labels in gcloud --labels format, e.g.
+#                          "team=infra,env=demo" (default: none). Useful when an
+#                          organization policy requires labels on new instances.
 
 set -euo pipefail
 
@@ -73,6 +76,7 @@ else
     GCP_SUBNET="${GCP_SUBNET:-}"
     GCP_SERVICE_ACCOUNT="${GCP_SERVICE_ACCOUNT:-}"
 fi
+GCP_LABELS="${GCP_LABELS:-}"
 
 log() { echo ""; echo "===== $* ====="; echo ""; }
 
@@ -194,6 +198,13 @@ if [ "$VM_BACKEND" = "gcp" ]; then
     }
     ' "$SCRIPT_DIR/vm/cloud-init-gcp.yaml" > "$RENDERED_CLOUD_INIT"
 
+    # Optional labels; the ${arr[@]+...} form keeps an empty array safe under
+    # `set -u` on bash 3.2.
+    LABEL_ARGS=()
+    if [ -n "$GCP_LABELS" ]; then
+        LABEL_ARGS=(--labels="$GCP_LABELS")
+    fi
+
     gcloud compute instances create "$NODE_ID" \
         --project="$GCP_PROJECT" \
         --zone="$GCP_ZONE" \
@@ -204,6 +215,7 @@ if [ "$VM_BACKEND" = "gcp" ]; then
         --image-family=ubuntu-2204-lts \
         --image-project=ubuntu-os-cloud \
         --boot-disk-size=10GB \
+        ${LABEL_ARGS[@]+"${LABEL_ARGS[@]}"} \
         --metadata-from-file=user-data="$RENDERED_CLOUD_INIT"
     rm -f "$RENDERED_CLOUD_INIT"
 

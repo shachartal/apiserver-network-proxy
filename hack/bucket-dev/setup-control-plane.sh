@@ -13,23 +13,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# setup-control-plane.sh — Set up the overlay control plane (k3d + PKI + pods).
+# setup-control-plane.sh — Set up the overlay control plane (underlay + PKI + pods).
 #
-# This creates the k3d cluster, generates control-plane PKI, uploads the CA
-# cert to GCS, builds the bucket-proxy-server image, and deploys the overlay
+# This prepares the underlay cluster, generates control-plane PKI, uploads the
+# CA cert to GCS, builds the bucket-proxy-server image, and deploys the overlay
 # control plane pods (etcd, apiserver, controller-manager, scheduler).
+#
+# The underlay is selected by UNDERLAY (see lib-underlay.sh):
+#   k3d (default) — creates a local k3d cluster
+#   gke           — uses the existing GKE cluster from hack/terraform/gke-demo;
+#                   mirrors registry.k8s.io images and pushes the server image
+#                   to Artifact Registry; GCS via Workload Identity
 #
 # Run this once. Then use setup-worker.sh to add worker VMs.
 #
+# Usage:
+#   ./setup-control-plane.sh                 full setup
+#   ./setup-control-plane.sh --port-forward  only (re)start the local forward
+#                                            to the overlay apiserver and check
+#                                            it (UNDERLAY=gke; on k3d the port
+#                                            is a host-mapped NodePort)
+#
 # Prerequisites:
-#   - docker, k3d, kubectl, openssl, crane, gcloud
+#   - docker, kubectl, openssl, crane, gcloud; k3d for UNDERLAY=k3d
 #   - Run 'make build-bucket-linux' first to build the linux server binary
 #   - Run './upload-distributables.sh' once to upload kubelet, containerd, etc. to GCS
 #
 # Environment variables:
-#   GCS_CREDENTIALS_FILE — path to GCS credentials JSON file (required)
+#   GCS_CREDENTIALS_FILE — path to GCS credentials JSON file (required; used
+#                          locally by gcloud, and mounted into the pod on k3d)
 #   GCS_BUCKET           — GCS bucket name (required)
 #   GCS_PREFIX           — key prefix within the bucket (default: "bucket-dev/")
+#   UNDERLAY             — "k3d" (default) or "gke"
+#   GCP_PROJECT, GKE_AR_REPO, GKE_CLUSTER, GKE_REGION — UNDERLAY=gke, see lib-underlay.sh
 
 set -euo pipefail
 
@@ -43,38 +59,71 @@ if [ -f "$SCRIPT_DIR/demo.env" ]; then
     set +a
 fi
 
-CLUSTER_NAME="bucket-dev"
-NAMESPACE="overlay-system"
 BUCKET_DIR="/tmp/bucket-dev"
 PKI_DIR="/tmp/bucket-dev-pki"
 GCS_CREDENTIALS_FILE="${GCS_CREDENTIALS_FILE:-}"
 GCS_BUCKET="${GCS_BUCKET:-}"
 GCS_PREFIX="${GCS_PREFIX:-bucket-dev/}"
 
+source "$SCRIPT_DIR/lib-underlay.sh"
+
 log() { echo ""; echo "===== $* ====="; echo ""; }
 
-# Detect host architecture for the server image (k3d runs on the host).
-HOST_ARCH="$(uname -m)"
-case "$HOST_ARCH" in
-    x86_64)  GOARCH="amd64" ;;
-    aarch64|arm64) GOARCH="arm64" ;;
-    *) echo "ERROR: unsupported architecture $HOST_ARCH"; exit 1 ;;
-esac
+# Wait for the overlay apiserver to answer /healthz on the local port.
+verify_overlay_apiserver() {
+    echo "Testing overlay apiserver at https://127.0.0.1:${OVERLAY_LOCAL_PORT}..."
+    for i in $(seq 1 10); do
+        if kubectl --kubeconfig="$PKI_DIR/admin.kubeconfig" get --raw /healthz 2>/dev/null; then
+            echo ""
+            echo "Overlay apiserver is healthy!"
+            return 0
+        fi
+        echo "  Waiting for apiserver to be reachable... ($i/10)"
+        sleep 3
+    done
+    echo "WARNING: overlay apiserver not reachable at 127.0.0.1:${OVERLAY_LOCAL_PORT}"
+    return 1
+}
+
+# --port-forward: re-establish local access to an existing overlay and exit.
+if [ "${1:-}" = "--port-forward" ]; then
+    if [ ! -f "$PKI_DIR/admin.kubeconfig" ]; then
+        echo "ERROR: $PKI_DIR/admin.kubeconfig not found; run a full setup first."
+        exit 1
+    fi
+    if is_gke; then
+        log "Restarting overlay apiserver port-forward"
+        gke_ensure_context
+        start_overlay_port_forward
+    else
+        echo "UNDERLAY=k3d: port ${OVERLAY_LOCAL_PORT} is a k3d host mapping, no forward needed."
+        echo "If unreachable, check the cluster is running: k3d cluster start ${K3D_CLUSTER_NAME}"
+    fi
+    verify_overlay_apiserver
+    exit $?
+elif [ $# -gt 0 ]; then
+    echo "Usage: $0 [--port-forward]"
+    exit 1
+fi
 
 # ============================================================
 # 0. Preflight checks
 # ============================================================
-log "Preflight checks"
+log "Preflight checks (underlay: $UNDERLAY)"
 
-for cmd in docker k3d kubectl openssl crane gcloud; do
+REQUIRED_CMDS="docker kubectl openssl crane gcloud"
+is_gke || REQUIRED_CMDS="$REQUIRED_CMDS k3d"
+for cmd in $REQUIRED_CMDS; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: $cmd is required but not found in PATH"
         exit 1
     fi
 done
 
-if [ ! -f "$REPO_ROOT/bin/bucket-proxy-server-linux-${GOARCH}" ]; then
-    echo "ERROR: Server binary not found (bin/bucket-proxy-server-linux-${GOARCH})."
+underlay_check_gke_vars
+
+if [ ! -f "$REPO_ROOT/bin/bucket-proxy-server-linux-${SERVER_GOARCH}" ]; then
+    echo "ERROR: Server binary not found (bin/bucket-proxy-server-linux-${SERVER_GOARCH})."
     echo "Run 'make build-bucket-linux' first."
     exit 1
 fi
@@ -102,11 +151,14 @@ mkdir -p "$PKI_DIR"
 # ============================================================
 log "Checking distributables in GCS"
 
-export CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$GCS_CREDENTIALS_FILE"
+# Use the GCS credentials file only for bucket operations. Not exported:
+# on UNDERLAY=gke, gcloud must keep the user's own credentials for
+# get-credentials, Artifact Registry and gke-gcloud-auth-plugin.
+gcs() { CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$GCS_CREDENTIALS_FILE" gcloud storage "$@"; }
 GCS_BASE="gs://${GCS_BUCKET}/${GCS_PREFIX}"
 
 SENTINEL="${GCS_BASE}distributables/.uploaded"
-if ! gcloud storage ls "$SENTINEL" &>/dev/null; then
+if ! gcs ls "$SENTINEL" &>/dev/null; then
     echo "ERROR: Distributables not found in GCS."
     echo "Run ./upload-distributables.sh first to upload kubelet, containerd, etc."
     exit 1
@@ -127,56 +179,67 @@ log "Uploading CA cert to GCS"
 
 mkdir -p "$BUCKET_DIR/pki"
 cp "$PKI_DIR/ca.crt" "$BUCKET_DIR/pki/ca.crt"
-gcloud storage cp "$BUCKET_DIR/pki/ca.crt" "${GCS_BASE}pki/ca.crt"
+gcs cp "$BUCKET_DIR/pki/ca.crt" "${GCS_BASE}pki/ca.crt"
 
 echo "CA cert upload complete."
 
 # ============================================================
-# 5. Create k3d cluster
+# 5. Prepare underlay cluster
 # ============================================================
-log "Creating k3d cluster: $CLUSTER_NAME"
+if is_gke; then
+    log "Using GKE cluster: $GKE_CLUSTER ($GKE_REGION)"
 
-# Delete existing cluster if present.
-k3d cluster delete "$CLUSTER_NAME" 2>/dev/null || true
+    gke_ensure_context
+    # Same as the k3d path: later scripts (show-costs.sh, benchmark-costs.sh)
+    # use the current context to reach the overlay-system namespace.
+    kubectl config use-context "$UNDERLAY_CONTEXT"
 
-k3d cluster create "$CLUSTER_NAME" \
-    --k3s-arg "--disable=traefik@server:0" \
-    --k3s-arg "--disable=servicelb@server:0" \
-    --k3s-arg "--disable=metrics-server@server:0" \
-    --port "30443:30443@server:0"
+    # Start from a clean overlay (equivalent to recreating the k3d cluster).
+    # This regenerates the PKI below, so old etcd data (in the PVC, deleted
+    # with the namespace) would not match the new certs and service-account keys.
+    ukubectl delete namespace "$NAMESPACE" --ignore-not-found --wait=true
+else
+    log "Creating k3d cluster: $K3D_CLUSTER_NAME"
 
-# Wait for k3d to be ready.
-kubectl config use-context "k3d-${CLUSTER_NAME}"
-kubectl wait --for=condition=Ready node --all --timeout=60s
+    # Delete existing cluster if present.
+    k3d cluster delete "$K3D_CLUSTER_NAME" 2>/dev/null || true
+
+    k3d cluster create "$K3D_CLUSTER_NAME" \
+        --k3s-arg "--disable=traefik@server:0" \
+        --k3s-arg "--disable=servicelb@server:0" \
+        --k3s-arg "--disable=metrics-server@server:0" \
+        --port "${OVERLAY_LOCAL_PORT}:30443@server:0"
+
+    # Wait for k3d to be ready.
+    kubectl config use-context "$UNDERLAY_CONTEXT"
+    ukubectl wait --for=condition=Ready node --all --timeout=60s
+fi
 
 # ============================================================
-# 6. Build and load bucket-proxy-server image into k3d
+# 6. Build and publish container images
 # ============================================================
-log "Building bucket-proxy-server container image"
+if is_gke; then
+    log "Publishing images to Artifact Registry: $GKE_AR_REPO"
 
-TMPIMG=$(mktemp -d)
-cp "$REPO_ROOT/bin/bucket-proxy-server-linux-${GOARCH}" "$TMPIMG/bucket-proxy-server"
-cat > "$TMPIMG/Dockerfile" <<'DOCKERFILE'
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY bucket-proxy-server /bucket-proxy-server
-ENTRYPOINT ["/bucket-proxy-server"]
-DOCKERFILE
+    ar_login
+    mirror_control_plane_images
+    push_server_image_gke
+else
+    log "Building bucket-proxy-server container image"
 
-docker build -t bucket-proxy-server:dev "$TMPIMG"
-rm -rf "$TMPIMG"
-
-k3d image import bucket-proxy-server:dev -c "$CLUSTER_NAME"
+    build_server_image "$SERVER_GOARCH" "$SERVER_IMAGE"
+    k3d image import "$SERVER_IMAGE" -c "$K3D_CLUSTER_NAME"
+fi
 
 # ============================================================
 # 7. Deploy overlay control plane
 # ============================================================
 log "Deploying overlay control plane in namespace $NAMESPACE"
 
-kubectl create namespace "$NAMESPACE" 2>/dev/null || true
+ukubectl create namespace "$NAMESPACE" 2>/dev/null || true
 
 # Create PKI secret.
-kubectl -n "$NAMESPACE" create secret generic overlay-pki \
+ukubectl -n "$NAMESPACE" create secret generic overlay-pki \
     --from-file=ca.crt="$PKI_DIR/ca.crt" \
     --from-file=ca.key="$PKI_DIR/ca.key" \
     --from-file=apiserver.crt="$PKI_DIR/apiserver.crt" \
@@ -185,64 +248,58 @@ kubectl -n "$NAMESPACE" create secret generic overlay-pki \
     --from-file=apiserver-kubelet-client.key="$PKI_DIR/apiserver-kubelet-client.key" \
     --from-file=sa.key="$PKI_DIR/sa.key" \
     --from-file=sa.pub="$PKI_DIR/sa.pub" \
-    --dry-run=client -o yaml | kubectl apply -f -
+    --dry-run=client -o yaml | ukubectl apply -f -
 
 # Create kubeconfigs secret.
-kubectl -n "$NAMESPACE" create secret generic overlay-kubeconfigs \
+ukubectl -n "$NAMESPACE" create secret generic overlay-kubeconfigs \
     --from-file=controller-manager.kubeconfig="$PKI_DIR/controller-manager.kubeconfig" \
     --from-file=scheduler.kubeconfig="$PKI_DIR/scheduler.kubeconfig" \
-    --dry-run=client -o yaml | kubectl apply -f -
+    --dry-run=client -o yaml | ukubectl apply -f -
 
-# Create GCS credentials secret for the bucket-proxy-server sidecar.
-kubectl -n "$NAMESPACE" create secret generic gcs-credentials \
-    --from-file=application_default_credentials.json="$GCS_CREDENTIALS_FILE" \
-    --dry-run=client -o yaml | kubectl apply -f -
+# GCS credentials secret for the bucket-proxy-server sidecar. Not used on GKE,
+# where the sidecar authenticates via Workload Identity (the gke-demo Terraform
+# binds the overlay-system namespace to roles/storage.admin).
+if ! is_gke; then
+    ukubectl -n "$NAMESPACE" create secret generic gcs-credentials \
+        --from-file=application_default_credentials.json="$GCS_CREDENTIALS_FILE" \
+        --dry-run=client -o yaml | ukubectl apply -f -
+fi
 
 # Apply manifests in order, waiting for dependencies.
-kubectl apply -f "$SCRIPT_DIR/manifests/egress-selector.yaml"
-kubectl apply -f "$SCRIPT_DIR/manifests/etcd.yaml"
+apply_manifest egress-selector
+apply_manifest etcd
 
 # etcd is a StatefulSet with a PVC; first rollout includes volume provisioning.
-echo "Waiting for etcd to be ready..."
-kubectl -n "$NAMESPACE" rollout status statefulset/etcd --timeout=120s
+echo "Waiting for etcd to be ready (timeout $ETCD_WAIT_TIMEOUT)..."
+ukubectl -n "$NAMESPACE" rollout status statefulset/etcd --timeout="$ETCD_WAIT_TIMEOUT"
 
-sed -e "s|GCS_BUCKET_PLACEHOLDER|${GCS_BUCKET}|g" \
-    -e "s|GCS_PREFIX_PLACEHOLDER|${GCS_PREFIX}|g" \
-    "$SCRIPT_DIR/manifests/apiserver.yaml" | kubectl apply -f -
+apply_manifest apiserver
 
-echo "Waiting for kube-apiserver to be ready..."
-kubectl -n "$NAMESPACE" rollout status deployment/kube-apiserver --timeout=120s
+echo "Waiting for kube-apiserver to be ready (timeout $APISERVER_WAIT_TIMEOUT)..."
+ukubectl -n "$NAMESPACE" rollout status deployment/kube-apiserver --timeout="$APISERVER_WAIT_TIMEOUT"
 
-kubectl apply -f "$SCRIPT_DIR/manifests/controller-manager.yaml"
-kubectl apply -f "$SCRIPT_DIR/manifests/scheduler.yaml"
+apply_manifest controller-manager
+apply_manifest scheduler
 
 echo "Waiting for controller-manager and scheduler..."
-kubectl -n "$NAMESPACE" rollout status deployment/kube-controller-manager --timeout=120s
-kubectl -n "$NAMESPACE" rollout status deployment/kube-scheduler --timeout=120s
-kubectl -n "$NAMESPACE" get pods,pvc
+ukubectl -n "$NAMESPACE" rollout status deployment/kube-controller-manager --timeout="$APISERVER_WAIT_TIMEOUT"
+ukubectl -n "$NAMESPACE" rollout status deployment/kube-scheduler --timeout="$APISERVER_WAIT_TIMEOUT"
+ukubectl -n "$NAMESPACE" get pods,pvc
 
 # ============================================================
 # 8. Verify overlay apiserver is reachable
 # ============================================================
 log "Verifying overlay apiserver"
 
-echo "Testing overlay apiserver via NodePort..."
-for i in $(seq 1 10); do
-    if kubectl --kubeconfig="$PKI_DIR/admin.kubeconfig" get --raw /healthz 2>/dev/null; then
-        echo ""
-        echo "Overlay apiserver is healthy!"
-        break
-    fi
-    echo "  Waiting for apiserver to be reachable... ($i/10)"
-    sleep 3
-done
+start_overlay_port_forward
+verify_overlay_apiserver || true
 
 # ============================================================
 # Summary
 # ============================================================
 log "Control plane setup complete!"
 
-echo "Underlay cluster:  k3d-${CLUSTER_NAME}"
+echo "Underlay cluster:  ${UNDERLAY_CONTEXT} (${UNDERLAY})"
 echo "Overlay namespace: $NAMESPACE"
 echo "GCS bucket:        gs://${GCS_BUCKET}/${GCS_PREFIX}"
 echo "PKI directory:     $PKI_DIR"

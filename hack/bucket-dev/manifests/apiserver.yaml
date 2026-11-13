@@ -72,7 +72,9 @@ spec:
             - --store-type=gcs
             - --gcs-bucket=GCS_BUCKET_PLACEHOLDER
             - --gcs-prefix=GCS_PREFIX_PLACEHOLDER
-            - --gcs-credentials-file=/gcs/application_default_credentials.json
+            # Lines marked "k3d-only" are stripped on UNDERLAY=gke, where the
+            # sidecar uses Workload Identity (ADC) instead of a credentials file.
+            - --gcs-credentials-file=/gcs/application_default_credentials.json # k3d-only
             - --uds-name=/run/konnectivity/konnectivity.socket
             - --server-id=bucket-server-0
             - --health-port=8092
@@ -90,9 +92,9 @@ spec:
           volumeMounts:
             - name: konnectivity-uds
               mountPath: /run/konnectivity
-            - name: gcs-credentials
-              mountPath: /gcs
-              readOnly: true
+            - name: gcs-credentials # k3d-only
+              mountPath: /gcs # k3d-only
+              readOnly: true # k3d-only
           readinessProbe:
             httpGet:
               path: /healthz
@@ -109,9 +111,9 @@ spec:
             name: egress-selector-config
         - name: konnectivity-uds
           emptyDir: {}
-        - name: gcs-credentials
-          secret:
-            secretName: gcs-credentials
+        - name: gcs-credentials # k3d-only
+          secret: # k3d-only
+            secretName: gcs-credentials # k3d-only
 ---
 apiVersion: v1
 kind: Service
