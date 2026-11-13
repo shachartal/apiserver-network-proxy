@@ -6,7 +6,9 @@ communicating with kubelets via GCS instead of gRPC.
 ## What you're demonstrating
 
 A Kubernetes control plane (kube-apiserver, etcd, controller-manager, scheduler)
-runs in a k3d cluster on your laptop. One or more worker VMs run a kubelet and
+runs in a k3d cluster on your laptop (or, with `UNDERLAY=gke`, in a GKE
+Autopilot cluster; see [GKE underlay](#gke-underlay-optional)). One or more
+worker VMs run a kubelet and
 bucket-proxy-agent. The two sides communicate **exclusively through a GCS
 bucket** -- no direct network path exists between them. Every `kubectl exec`,
 pod creation, and log fetch flows as protobuf files through cloud storage.
@@ -362,6 +364,66 @@ cp demo.env.example demo.env
 Everything else works identically. The only difference: the VM has internet
 access (it's local), so this variant doesn't demonstrate the "zero connectivity"
 aspect as dramatically as the GCP variant with its deny-all-egress firewall.
+
+## GKE underlay (optional)
+
+By default the overlay control plane runs in a local k3d cluster. With
+`UNDERLAY=gke` it runs in a GKE Autopilot cluster instead, which keeps it up
+independently of your laptop. Worker VMs (`VM_BACKEND`) are unaffected.
+
+What changes on GKE:
+
+- The cluster comes from `hack/terraform/gke-demo/`: a private Autopilot
+  cluster (no node external IPs, no Cloud NAT) whose control-plane endpoint
+  accepts only `global_authorized_networks`, plus an Artifact Registry repo and
+  a comms bucket.
+- Images go to Artifact Registry. The registry.k8s.io control-plane images are
+  mirrored there, since the private nodes cannot reach registry.k8s.io.
+- The bucket-proxy-server sidecar reaches GCS via Workload Identity, so no
+  credentials file is mounted.
+- The overlay apiserver is reached with a background `kubectl port-forward` on
+  `127.0.0.1:30443` (the same address as the k3d NodePort, so the admin
+  kubeconfig is unchanged).
+
+Additional prerequisites: `terraform` and `gke-gcloud-auth-plugin`
+(`gcloud components install gke-gcloud-auth-plugin`).
+
+```bash
+# 1. Provision the cluster. global_authorized_networks is required: list the
+#    egress IP(s) you'll run kubectl from.
+cd hack/terraform/gke-demo
+cat > terraform.tfvars <<'TFVARS'
+project_id = "my-gcp-project"
+global_authorized_networks = [
+  { cidr_block = "203.0.113.7/32", display_name = "my-laptop" },
+]
+# labels = { team = "infra" }   # optional, e.g. if an org policy requires labels
+TFVARS
+terraform init && terraform apply
+
+# 2. Point the scripts at it (in hack/bucket-dev/demo.env).
+#    GCS_BUCKET  = terraform output -raw comms_bucket_name
+#    GKE_AR_REPO = terraform output -raw artifact_registry_url
+UNDERLAY=gke
+GKE_AR_REPO=us-east1-docker.pkg.dev/my-gcp-project/bucket-dev
+
+# 3. Same scripts as before.
+cd ../../bucket-dev
+./setup-control-plane.sh
+./setup-worker.sh
+```
+
+If the port-forward drops (e.g. the apiserver pod restarted), restore it with
+`./setup-control-plane.sh --port-forward`. `redeploy-server.sh` restarts it
+automatically.
+
+`teardown-control-plane.sh` deletes only the `overlay-system` namespace; the
+cluster, registry and bucket stay until `terraform destroy` in
+`hack/terraform/gke-demo/`.
+
+If a TLS-intercepting proxy on your network re-signs the GKE endpoint's
+certificate, kubectl fails with x509 errors. Trust the proxy's CA, or (demo
+only) set `GKE_INSECURE_SKIP_TLS_VERIFY=true`.
 
 ## Architecture notes
 

@@ -107,7 +107,7 @@ Setup:
 Teardown:
 - `teardown.sh` — Discovers all workers, tears them down, cleans GCS, removes control plane
 - `teardown-worker.sh` — Tears down a single worker by `NODE_ID`
-- `teardown-control-plane.sh` — Removes k3d cluster and local state
+- `teardown-control-plane.sh` — Removes k3d cluster (or the overlay namespace on GKE) and local state
 - `cleanup-bucket.sh` — Deletes all transport messages from GCS (not distributables)
 
 Iteration:
@@ -118,6 +118,10 @@ Iteration:
 The worker VM backend is controlled by `VM_BACKEND`:
 - `multipass` (default) — Local VM, requires `multipass` CLI and a GCS credentials file
 - `gcp` — GCE VM in a locked-down VPC, uses VM service account ADC for GCS (no credentials file on VM)
+
+The cluster hosting the overlay control plane is controlled by `UNDERLAY` (`hack/bucket-dev/lib-underlay.sh`):
+- `k3d` (default) — Local k3d cluster; server image imported directly; GCS credentials file mounted from a Secret
+- `gke` — Existing GKE Autopilot cluster from `hack/terraform/gke-demo/` (private nodes, authorized-networks-only endpoint); images in Artifact Registry; GCS via Workload Identity; overlay apiserver reached via `kubectl port-forward`. Requires `GCP_PROJECT` and `GKE_AR_REPO`
 
 GCP-specific variables (set in `setup.sh` defaults or env):
 - `GCP_PROJECT`, `GCP_ZONE`, `GCP_NETWORK`, `GCP_SUBNET`, `GCP_SERVICE_ACCOUNT`
