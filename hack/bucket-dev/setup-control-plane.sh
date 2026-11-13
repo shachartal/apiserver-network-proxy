@@ -202,22 +202,24 @@ kubectl -n "$NAMESPACE" create secret generic gcs-credentials \
 kubectl apply -f "$SCRIPT_DIR/manifests/egress-selector.yaml"
 kubectl apply -f "$SCRIPT_DIR/manifests/etcd.yaml"
 
+# etcd is a StatefulSet with a PVC; first rollout includes volume provisioning.
 echo "Waiting for etcd to be ready..."
-kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/etcd --timeout=60s
+kubectl -n "$NAMESPACE" rollout status statefulset/etcd --timeout=120s
 
 sed -e "s|GCS_BUCKET_PLACEHOLDER|${GCS_BUCKET}|g" \
     -e "s|GCS_PREFIX_PLACEHOLDER|${GCS_PREFIX}|g" \
     "$SCRIPT_DIR/manifests/apiserver.yaml" | kubectl apply -f -
 
 echo "Waiting for kube-apiserver to be ready..."
-kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/kube-apiserver --timeout=120s
+kubectl -n "$NAMESPACE" rollout status deployment/kube-apiserver --timeout=120s
 
 kubectl apply -f "$SCRIPT_DIR/manifests/controller-manager.yaml"
 kubectl apply -f "$SCRIPT_DIR/manifests/scheduler.yaml"
 
 echo "Waiting for controller-manager and scheduler..."
-sleep 5
-kubectl -n "$NAMESPACE" get pods
+kubectl -n "$NAMESPACE" rollout status deployment/kube-controller-manager --timeout=120s
+kubectl -n "$NAMESPACE" rollout status deployment/kube-scheduler --timeout=120s
+kubectl -n "$NAMESPACE" get pods,pvc
 
 # ============================================================
 # 8. Verify overlay apiserver is reachable

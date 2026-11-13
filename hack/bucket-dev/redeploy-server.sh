@@ -19,7 +19,7 @@
 #   1. Rebuilds the Go binary for the current architecture
 #   2. Rebuilds the Docker image
 #   3. Imports it into k3d
-#   4. Restarts the kube-apiserver pod to pick up the new image
+#   4. Rolls out the kube-apiserver Deployment with the new image
 #
 # Usage: ./redeploy-server.sh
 
@@ -68,12 +68,7 @@ rm -rf "$TMPIMG"
 echo "==> Importing image into k3d cluster..."
 k3d image import bucket-proxy-server:dev -c "$CLUSTER_NAME"
 
-echo "==> Restarting kube-apiserver pod..."
-# Delete the pod; it will be recreated by the kubelet.
-# Since it's not a Deployment, we need to re-apply the manifest.
-kubectl -n "$NAMESPACE" delete pod kube-apiserver --wait=false 2>/dev/null || true
-
-# Re-apply the manifest to recreate the pod (with templated GCS settings).
+echo "==> Rolling out kube-apiserver..."
 if [ -z "$GCS_BUCKET" ]; then
     echo "ERROR: GCS_BUCKET must be set (or use demo.env)"
     exit 1
@@ -81,12 +76,15 @@ fi
 sed -e "s|GCS_BUCKET_PLACEHOLDER|${GCS_BUCKET}|g" \
     -e "s|GCS_PREFIX_PLACEHOLDER|${GCS_PREFIX}|g" \
     "$SCRIPT_DIR/manifests/apiserver.yaml" | kubectl apply -f -
+# The image tag (bucket-proxy-server:dev) is reused, so the pod template is
+# unchanged and apply alone would not roll.
+kubectl -n "$NAMESPACE" rollout restart deployment/kube-apiserver
 
 echo "==> Waiting for kube-apiserver to be ready..."
-kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/kube-apiserver --timeout=60s
+kubectl -n "$NAMESPACE" rollout status deployment/kube-apiserver --timeout=120s
 
 echo ""
 echo "==> Server redeployed successfully!"
 echo ""
 echo "Check logs with:"
-echo "  kubectl -n $NAMESPACE logs kube-apiserver -c bucket-proxy-server -f"
+echo "  kubectl -n $NAMESPACE logs deploy/kube-apiserver -c bucket-proxy-server -f"

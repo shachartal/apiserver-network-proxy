@@ -129,7 +129,7 @@ GCP networking infrastructure (`hack/terraform/demo-env/`):
 - Worker service account with `roles/storage.admin`
 
 Known quirks:
-- After `redeploy-server.sh`, kube-apiserver pod may not restart. Fix: `kubectl apply -f hack/bucket-dev/manifests/apiserver.yaml`
+- Overlay control plane runs as controllers (etcd StatefulSet with 1Gi PVC; apiserver/controller-manager/scheduler Deployments, `strategy: Recreate`). Required on GKE Autopilot, where system-cluster-critical pods (e.g. kube-dns) preempt priority-0 pods. Never run 2 apiserver replicas: sidecars share `--server-id`.
 - After server restart, also restart agent+kubelet on VM to reset sequence counters
 - Worker image pulls: `push-images.sh` stores images under the full upstream name (repo `docker.io/library/busybox`), but containerd asks a mirror for the path without the registry host. cloud-init therefore writes per-registry `certs.d/<registry>/hosts.toml` with `override_path = true` (docker.io, registry.k8s.io). Adding images from another registry needs a matching hosts.toml entry. cloud-init still pre-pulls the pause image directly from the local registry.
 

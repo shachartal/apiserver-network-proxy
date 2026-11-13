@@ -126,7 +126,7 @@ collect_metrics() {
     local local_port=18095
 
     # Start a long-lived port-forward for the server metrics.
-    kubectl -n "$NAMESPACE" port-forward pod/kube-apiserver "${local_port}:${SERVER_ADMIN_PORT}" &>/dev/null &
+    kubectl -n "$NAMESPACE" port-forward deploy/kube-apiserver "${local_port}:${SERVER_ADMIN_PORT}" &>/dev/null &
     local pf_pid=$!
     sleep 2
 

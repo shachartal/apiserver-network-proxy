@@ -1,41 +1,65 @@
-apiVersion: v1
-kind: Pod
+# etcd runs as a single-replica StatefulSet with a PersistentVolumeClaim so it
+# is recreated (with its data) if the pod is deleted — e.g. preempted by a
+# higher-priority GKE system pod on Autopilot. The claim uses the cluster's
+# default StorageClass (k3d: local-path, GKE: standard-rwo). Deleting the
+# overlay-system namespace (setup/teardown) deletes the claim and its data.
+apiVersion: apps/v1
+kind: StatefulSet
 metadata:
   name: etcd
   namespace: overlay-system
-  labels:
-    component: etcd
 spec:
-  containers:
-    - name: etcd
-      image: registry.k8s.io/etcd:3.5.12-0
-      command:
-        - etcd
-        - --data-dir=/var/lib/etcd
-        - --name=etcd-0
-        - --listen-client-urls=http://0.0.0.0:2379
-        - --advertise-client-urls=http://etcd.overlay-system.svc:2379
-        - --listen-peer-urls=http://0.0.0.0:2380
-        - --initial-advertise-peer-urls=http://etcd.overlay-system.svc:2380
-        - --initial-cluster=etcd-0=http://etcd.overlay-system.svc:2380
-        - --initial-cluster-state=new
-      ports:
-        - containerPort: 2379
-          name: client
-        - containerPort: 2380
-          name: peer
-      volumeMounts:
-        - name: etcd-data
-          mountPath: /var/lib/etcd
-      readinessProbe:
-        httpGet:
-          path: /health
-          port: 2379
-        initialDelaySeconds: 5
-        periodSeconds: 5
-  volumes:
-    - name: etcd-data
-      emptyDir: {}
+  serviceName: etcd
+  replicas: 1
+  selector:
+    matchLabels:
+      component: etcd
+  template:
+    metadata:
+      labels:
+        component: etcd
+    spec:
+      containers:
+        - name: etcd
+          image: registry.k8s.io/etcd:3.5.12-0
+          command:
+            - etcd
+            # Subdirectory of the volume: block-device filesystems have a
+            # lost+found at the root, and etcd wants a 0700 dir it creates.
+            - --data-dir=/var/lib/etcd/data
+            - --name=etcd-0
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://etcd.overlay-system.svc:2379
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --initial-advertise-peer-urls=http://etcd.overlay-system.svc:2380
+            - --initial-cluster=etcd-0=http://etcd.overlay-system.svc:2380
+            - --initial-cluster-state=new
+          ports:
+            - containerPort: 2379
+              name: client
+            - containerPort: 2380
+              name: peer
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: etcd-data
+              mountPath: /var/lib/etcd
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 2379
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: etcd-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
 ---
 apiVersion: v1
 kind: Service

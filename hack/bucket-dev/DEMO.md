@@ -187,7 +187,7 @@ gcloud storage ls "gs://${GCS_BUCKET}/bucket-dev/node-to-control/" --recursive
 
 Watch the server detect heartbeats:
 ```bash
-kubectl -n overlay-system logs kube-apiserver -c bucket-proxy-server -f | grep -i heartbeat
+kubectl -n overlay-system logs deploy/kube-apiserver -c bucket-proxy-server -f | grep -i heartbeat
 ```
 
 You'll see:
@@ -203,7 +203,7 @@ is already working if flows 2 and 3 succeeded.
 
 To see it explicitly in the server logs:
 ```bash
-kubectl -n overlay-system logs kube-apiserver -c bucket-proxy-server -f | grep -i reverse
+kubectl -n overlay-system logs deploy/kube-apiserver -c bucket-proxy-server -f | grep -i reverse
 ```
 
 ### Flow 7: Cost benchmark
@@ -222,7 +222,7 @@ This produces a cost projection for 10, 100, and 1000 nodes.
 ### Server logs (bucket-proxy-server)
 
 ```bash
-kubectl -n overlay-system logs kube-apiserver -c bucket-proxy-server -f
+kubectl -n overlay-system logs deploy/kube-apiserver -c bucket-proxy-server -f
 ```
 
 Key things to watch for:
@@ -264,7 +264,7 @@ multipass exec $NODE_ID -- sudo journalctl -u kubelet -f
 
 Server metrics (via port-forward):
 ```bash
-kubectl -n overlay-system port-forward pod/kube-apiserver 8095:8095 &
+kubectl -n overlay-system port-forward deploy/kube-apiserver 8095:8095 &
 curl -s http://localhost:8095/metrics | grep konnectivity
 ```
 
@@ -308,11 +308,9 @@ To re-upload distributables (only changed files are uploaded):
 ./upload-distributables.sh
 ```
 
-**Known quirk**: After redeploying the server, the kube-apiserver pod sometimes
-doesn't come back. Fix:
-```bash
-kubectl apply -f hack/bucket-dev/manifests/apiserver.yaml
-```
+The overlay control plane runs as controllers (etcd StatefulSet with a 1Gi
+PVC; apiserver, controller-manager and scheduler Deployments), so pods that
+are deleted or preempted are recreated automatically and etcd keeps its data.
 
 **Note on agent startup timing**: The RegionalPoller implements a 5-minute grace
 period for messages from unregistered nodes. This means agents can safely start

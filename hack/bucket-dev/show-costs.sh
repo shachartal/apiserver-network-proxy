@@ -51,7 +51,7 @@ fetch_server_metrics() {
     else
         # Use port-forward since the server container may not have curl/wget.
         local local_port=18095
-        kubectl -n "$NAMESPACE" port-forward pod/kube-apiserver "${local_port}:${SERVER_ADMIN_PORT}" &>/dev/null &
+        kubectl -n "$NAMESPACE" port-forward deploy/kube-apiserver "${local_port}:${SERVER_ADMIN_PORT}" &>/dev/null &
         local pf_pid=$!
         sleep 2
         curl -s "http://127.0.0.1:${local_port}/metrics" 2>/dev/null || echo ""

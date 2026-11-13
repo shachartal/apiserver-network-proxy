@@ -1,40 +1,56 @@
-apiVersion: v1
-kind: Pod
+# Single-replica Deployment so the pod is recreated if deleted (e.g.
+# preempted on Autopilot). Recreate: no leader election is configured for a
+# second replica to hand over to, so avoid overlapping pods.
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: kube-controller-manager
   namespace: overlay-system
-  labels:
-    component: kube-controller-manager
 spec:
-  containers:
-    - name: kube-controller-manager
-      image: registry.k8s.io/kube-controller-manager:v1.30.0
-      command:
-        - kube-controller-manager
-        - --kubeconfig=/etc/kubernetes/controller-manager.kubeconfig
-        - --authentication-kubeconfig=/etc/kubernetes/controller-manager.kubeconfig
-        - --authorization-kubeconfig=/etc/kubernetes/controller-manager.kubeconfig
-        - --cluster-signing-cert-file=/pki/ca.crt
-        - --cluster-signing-key-file=/pki/ca.key
-        - --root-ca-file=/pki/ca.crt
-        - --service-account-private-key-file=/pki/sa.key
-        - --use-service-account-credentials=true
-        - --controllers=*
-        - --v=2
-      volumeMounts:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      component: kube-controller-manager
+  template:
+    metadata:
+      labels:
+        component: kube-controller-manager
+    spec:
+      containers:
+        - name: kube-controller-manager
+          image: registry.k8s.io/kube-controller-manager:v1.30.0
+          command:
+            - kube-controller-manager
+            - --kubeconfig=/etc/kubernetes/controller-manager.kubeconfig
+            - --authentication-kubeconfig=/etc/kubernetes/controller-manager.kubeconfig
+            - --authorization-kubeconfig=/etc/kubernetes/controller-manager.kubeconfig
+            - --cluster-signing-cert-file=/pki/ca.crt
+            - --cluster-signing-key-file=/pki/ca.key
+            - --root-ca-file=/pki/ca.crt
+            - --service-account-private-key-file=/pki/sa.key
+            - --use-service-account-credentials=true
+            - --controllers=*
+            - --v=2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: pki
+              mountPath: /pki
+              readOnly: true
+            - name: kubeconfig
+              mountPath: /etc/kubernetes
+              readOnly: true
+      volumes:
         - name: pki
-          mountPath: /pki
-          readOnly: true
+          secret:
+            secretName: overlay-pki
         - name: kubeconfig
-          mountPath: /etc/kubernetes
-          readOnly: true
-  volumes:
-    - name: pki
-      secret:
-        secretName: overlay-pki
-    - name: kubeconfig
-      secret:
-        secretName: overlay-kubeconfigs
-        items:
-          - key: controller-manager.kubeconfig
-            path: controller-manager.kubeconfig
+          secret:
+            secretName: overlay-kubeconfigs
+            items:
+              - key: controller-manager.kubeconfig
+                path: controller-manager.kubeconfig
