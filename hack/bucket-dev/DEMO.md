@@ -303,9 +303,8 @@ cd hack/bucket-dev
 NODE_ID=bucket-agent-XXXX ./redeploy-agent.sh
 ```
 
-To force re-upload of distributables:
+To re-upload distributables (only changed files are uploaded):
 ```bash
-gcloud storage rm "gs://${GCS_BUCKET}/bucket-dev/distributables/.uploaded"
 ./upload-distributables.sh
 ```
 

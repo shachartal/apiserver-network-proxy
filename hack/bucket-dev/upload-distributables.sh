@@ -103,6 +103,15 @@ GCS_BUCKET="$GCS_BUCKET" \
 GCS_PREFIX="$GCS_PREFIX" \
     "$SCRIPT_DIR/push-images.sh"
 
+# ============================================================
+# Mark upload complete
+# ============================================================
+# setup-control-plane.sh checks for this sentinel before deploying. Written
+# last so it only exists once both distributables and images are in place.
+# rsync above has no --delete, so it never removes this file.
+SENTINEL="${GCS_BASE}distributables/.uploaded"
+echo "Uploaded at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | gcloud storage cp - "$SENTINEL"
+
 echo ""
 log "Distributables and images uploaded successfully!"
 echo ""
