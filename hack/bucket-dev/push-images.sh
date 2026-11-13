@@ -39,9 +39,11 @@ GCS_PREFIX="${GCS_PREFIX:-bucket-dev/}"
 
 REGISTRY_VERSION="3.0.0"
 
-# Images to push into the bucket registry.
+# Images to push into the bucket registry. Bash array: one quoted image per
+# line, whitespace-separated (no commas).
 IMAGES=(
     "registry.k8s.io/pause:3.9"
+    "docker.io/library/busybox:1.36"
 )
 
 log() { echo "==> $*"; }

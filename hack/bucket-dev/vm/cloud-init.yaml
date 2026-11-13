@@ -31,7 +31,24 @@ write_files:
             [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
               SystemdCgroup = true
 
-  # Containerd mirror: route all image pulls through local registry first
+  # Containerd mirror: route all image pulls through local registry first.
+  # push-images.sh stores images under the full upstream name (e.g. repository
+  # "docker.io/library/busybox"), but a plain mirror is asked for the path
+  # without the registry host ("library/busybox") and 404s, so containerd falls
+  # back to the unreachable upstream. Per-registry files with override_path map
+  # each upstream registry onto its prefix in the local registry.
+  - path: /etc/containerd/certs.d/docker.io/hosts.toml
+    content: |
+      [host."http://127.0.0.1:5000/v2/docker.io"]
+        capabilities = ["pull", "resolve"]
+        override_path = true
+  - path: /etc/containerd/certs.d/registry.k8s.io/hosts.toml
+    content: |
+      [host."http://127.0.0.1:5000/v2/registry.k8s.io"]
+        capabilities = ["pull", "resolve"]
+        override_path = true
+  # Fallback for any other registry (only matches images pushed without a
+  # registry prefix).
   - path: /etc/containerd/certs.d/_default/hosts.toml
     content: |
       [host."http://127.0.0.1:5000"]

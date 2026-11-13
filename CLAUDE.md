@@ -131,7 +131,7 @@ GCP networking infrastructure (`hack/terraform/demo-env/`):
 Known quirks:
 - After `redeploy-server.sh`, kube-apiserver pod may not restart. Fix: `kubectl apply -f hack/bucket-dev/manifests/apiserver.yaml`
 - After server restart, also restart agent+kubelet on VM to reset sequence counters
-- Containerd CRI sandbox image pulls bypass the `_default/hosts.toml` mirror; cloud-init pre-pulls the pause image directly from the local registry to work around this
+- Worker image pulls: `push-images.sh` stores images under the full upstream name (repo `docker.io/library/busybox`), but containerd asks a mirror for the path without the registry host. cloud-init therefore writes per-registry `certs.d/<registry>/hosts.toml` with `override_path = true` (docker.io, registry.k8s.io). Adding images from another registry needs a matching hosts.toml entry. cloud-init still pre-pulls the pause image directly from the local registry.
 
 ## Code Conventions
 
