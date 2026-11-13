@@ -34,9 +34,11 @@
 # GCP-specific environment variables (required when VM_BACKEND=gcp):
 #   GCP_PROJECT          — GCP project ID
 #   GCP_ZONE             — GCP zone (default: "us-east1-b")
-#   GCP_NETWORK          — VPC name (from terraform output)
-#   GCP_SUBNET           — Subnet self-link (from terraform output)
-#   GCP_SERVICE_ACCOUNT  — Worker node service account email (from terraform output)
+#   GCP_NETWORK          — VPC name (default: "bucket-demo-vpc", from terraform output)
+#   GCP_SUBNET           — Subnet self-link (default: derived from GCP_PROJECT and
+#                          GCP_ZONE, from terraform output)
+#   GCP_SERVICE_ACCOUNT  — Worker node service account email (default: derived
+#                          from GCP_PROJECT, from terraform output)
 
 set -euo pipefail
 
@@ -58,11 +60,19 @@ GCS_PREFIX="${GCS_PREFIX:-bucket-dev/}"
 NODE_ID="${NODE_ID:-bucket-agent-$(openssl rand -hex 4)}"
 
 # GCP-specific variables (only used when VM_BACKEND=gcp).
-GCP_PROJECT="${GCP_PROJECT:-my-gcp-project}"
+# Network and service account defaults match the resource names created by
+# hack/terraform/demo-env, derived from GCP_PROJECT and the region of GCP_ZONE.
+GCP_PROJECT="${GCP_PROJECT:-}"
 GCP_ZONE="${GCP_ZONE:-us-east1-b}"
+GCP_REGION="${GCP_ZONE%-*}"
 GCP_NETWORK="${GCP_NETWORK:-bucket-demo-vpc}"
-GCP_SUBNET="${GCP_SUBNET:-https://www.googleapis.com/compute/v1/projects/my-gcp-project/regions/us-east1/subnetworks/bucket-demo-subnet}"
-GCP_SERVICE_ACCOUNT="${GCP_SERVICE_ACCOUNT:-bucket-demo-worker@my-gcp-project.iam.gserviceaccount.com}"
+if [ -n "$GCP_PROJECT" ]; then
+    GCP_SUBNET="${GCP_SUBNET:-https://www.googleapis.com/compute/v1/projects/${GCP_PROJECT}/regions/${GCP_REGION}/subnetworks/bucket-demo-subnet}"
+    GCP_SERVICE_ACCOUNT="${GCP_SERVICE_ACCOUNT:-bucket-demo-worker@${GCP_PROJECT}.iam.gserviceaccount.com}"
+else
+    GCP_SUBNET="${GCP_SUBNET:-}"
+    GCP_SERVICE_ACCOUNT="${GCP_SERVICE_ACCOUNT:-}"
+fi
 
 log() { echo ""; echo "===== $* ====="; echo ""; }
 
